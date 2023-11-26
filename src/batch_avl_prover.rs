@@ -465,7 +465,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_hash_is_correct() {
+    fn empty_digest_hash_is_correct() {
         let prover = BatchAVLProver::new(
             AVLTree::new(
                 |digest| Node::LabelOnly(NodeHeader::new(Some(*digest), None)),
@@ -474,11 +474,9 @@ mod tests {
             ),
             true,
         );
-        let digest = base16::encode_lower(&prover.digest().unwrap());
+        let actual = base16::encode_lower(&prover.digest().unwrap());
+        let expected = "4ec61f485b98eb87153f7c57db4f5ecd75556fddbc403b41acf8441fde8e160900";
 
-        assert_eq!(
-            digest,
-            "4ec61f485b98eb87153f7c57db4f5ecd75556fddbc403b41acf8441fde8e160900"
-        )
+        assert_eq!(actual, expected)
     }
 }

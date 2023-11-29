@@ -1,15 +1,15 @@
 use bytes::Bytes;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::time::Instant;
 use scorex_crypto_avltree::authenticated_tree_ops::*;
+use scorex_crypto_avltree::batch_avl_verifier::BatchAVLVerifier;
 use scorex_crypto_avltree::batch_node::*;
 use scorex_crypto_avltree::operation::*;
-use scorex_crypto_avltree::batch_avl_verifier::BatchAVLVerifier;
 use scorex_crypto_avltree::persistent_batch_avl_prover::*;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::time::Instant;
 
 mod common;
 use common::*;
@@ -492,14 +492,14 @@ fn test_removed_nodes_special_cases() {
     for m in &in_list {
         prover.perform_one_operation(m).unwrap();
     }
-	{
-		let rust_proof = prover.generate_proof();
-		let path = Path::new("tests/scala_proves/proof1.dmp");
-		let mut file = File::open(&path).unwrap();
-		let mut scala_proof = Vec::new();
+    {
+        let rust_proof = prover.generate_proof();
+        let path = Path::new("tests/scala_proves/proof1.dmp");
+        let mut file = File::open(&path).unwrap();
+        let mut scala_proof = Vec::new();
         file.read_to_end(&mut scala_proof).unwrap();
-		assert_eq!(rust_proof, &*scala_proof);
-	}
+        assert_eq!(rust_proof, &*scala_proof);
+    }
     let mods = [
         rem_op(b"5cb7a321448962d35dfbc168ffc5e372c07879592027571b6d4e6f15f257c871"),
         rem_op(b"628181857476ed88dcbf0d77c460b8626cd968a9bdf43c1d2ea67f2acd3694d3"),
@@ -732,14 +732,14 @@ fn test_removed_nodes_special_cases() {
     }
 
     let to_remove_nodes = prover.removed_nodes();
-	{
-		let rust_proof = prover.generate_proof();
-		let path = Path::new("tests/scala_proves/proof2.dmp");
-		let mut file = File::open(&path).unwrap();
-		let mut scala_proof = Vec::new();
+    {
+        let rust_proof = prover.generate_proof();
+        let path = Path::new("tests/scala_proves/proof2.dmp");
+        let mut file = File::open(&path).unwrap();
+        let mut scala_proof = Vec::new();
         file.read_to_end(&mut scala_proof).unwrap();
-		assert_eq!(rust_proof, &*scala_proof);
-	}
+        assert_eq!(rust_proof, &*scala_proof);
+    }
     for rn in &to_remove_nodes {
         assert!(!prover.contains(rn));
     }
@@ -808,10 +808,7 @@ fn test_return_removed_nodes() {
         let m_size = kv_list.len();
         let to_insert = kv_list.iter().map(|kv| Operation::Insert(kv.clone()));
         let to_remove: Vec<Operation> = (0..m_size)
-            .flat_map(|i| {
-                prover
-                    .random_walk(&mut StdRng::seed_from_u64(i as u64))
-            })
+            .flat_map(|i| prover.random_walk(&mut StdRng::seed_from_u64(i as u64)))
             .map(|kv| Operation::Remove(kv.key))
             .collect();
         let modifications = to_insert.chain(to_remove.clone());
@@ -871,10 +868,7 @@ fn test_proof_generation() {
             .map(|kv| Operation::Insert(kv.clone()))
             .collect();
         let to_remove: Vec<Operation> = (0..insert_num)
-            .flat_map(|i| {
-                prover
-                    .random_walk(&mut StdRng::seed_from_u64(i as u64))
-            })
+            .flat_map(|i| prover.random_walk(&mut StdRng::seed_from_u64(i as u64)))
             .map(|kv| Operation::Remove(kv.key))
             .collect();
         let mut modifications = to_insert.clone();
@@ -1123,7 +1117,7 @@ fn test_tree_varlen_key() {
     let mut digest = prover.digest().unwrap();
 
     for _ in 0..TEST_ITERATIONS {
-		let value_length = rand::thread_rng().gen_range(0..0x8000);
+        let value_length = rand::thread_rng().gen_range(0..0x8000);
         let key = random_key();
         let value = Bytes::from(vec![0u8; value_length]);
         let current_mods = [Operation::Insert(KeyValue { key, value })];
@@ -1149,8 +1143,8 @@ fn test_modifications() {
     for key_length in 1..KEY_LENGTH {
         for value_length in 1..VALUE_LENGTH {
             let mut prover = generate_prover(key_length, Some(value_length));
-            let key = Bytes::copy_from_slice(&random_key()[0..key_length]);
-            let value = Bytes::copy_from_slice(&random_key()[0..value_length]);
+            let key = Bytes::copy_from_slice(&random_key_with_len(key_length));
+            let value = Bytes::copy_from_slice(&random_key_with_len(value_length));
             let m = Operation::Insert(KeyValue {
                 key: key.clone(),
                 value: value.clone(),
@@ -1184,7 +1178,7 @@ fn test_modifications() {
 
             let mut unexisted_key: ADKey;
             loop {
-                unexisted_key = Bytes::copy_from_slice(&random_key()[0..key_length]);
+                unexisted_key = Bytes::copy_from_slice(&random_key_with_len(key_length));
                 if unexisted_key != key {
                     break;
                 }
@@ -1373,7 +1367,7 @@ fn test_verifier_fails() {
             assert!(p
                 .perform_one_operation(&Operation::Insert(random_kv()))
                 .is_ok()); // failed to insert
-		}
+        }
         let mut v = generate_verifier(
             &digest,
             &p.generate_proof(),
@@ -1383,20 +1377,22 @@ fn test_verifier_fails() {
             Some(0),
         );
         assert!(v.digest().is_some()); // verification failed to construct tree
-        // Try 5 inserts that do not match -- with overwhelming probability one of them will go to a leaf
-        // that is not in the conveyed tree, and verifier will complain
+                                       // Try 5 inserts that do not match -- with overwhelming probability one of them will go to a leaf
+                                       // that is not in the conveyed tree, and verifier will complain
         for _ in 0..5 {
             let key = random_key();
-            assert!(v.perform_one_operation(&Operation::Insert(KeyValue {
-                key: key.clone(),
-                value: random_value()
-            })).is_err());
-		}
+            assert!(v
+                .perform_one_operation(&Operation::Insert(KeyValue {
+                    key: key.clone(),
+                    value: random_value()
+                }))
+                .is_err());
+        }
         assert!(v.digest().is_none()); // verification succeeded when it should have failed, because of a missing leaf
 
         digest = p.digest().unwrap();
-		let kv = random_kv();
-		let key = kv.key.clone();
+        let kv = random_kv();
+        let key = kv.key.clone();
         assert!(p.perform_one_operation(&Operation::Insert(kv)).is_ok());
         pf = p.generate_proof();
         p.check_tree(false);
@@ -1413,10 +1409,12 @@ fn test_verifier_fails() {
             Some(0),
         );
         assert!(v.digest().is_some()); // verification failed to construct tree
-        assert!(v.perform_one_operation(&Operation::Insert(KeyValue {
-            key: key.clone(),
-            value: random_value()
-        })).is_err());
+        assert!(v
+            .perform_one_operation(&Operation::Insert(KeyValue {
+                key: key.clone(),
+                value: random_value()
+            }))
+            .is_err());
         assert!(v.digest().is_none()); // verification succeeded when it should have failed, because of the wrong direction
 
         // Change the key by a large amount -- verification should fail with overwhelming probability
@@ -1435,12 +1433,14 @@ fn test_verifier_fails() {
             Some(0),
         );
         assert!(v.digest().is_some()); // verification failed to construct tree
-        assert!(v.perform_one_operation(&Operation::Insert(KeyValue {
-            key,
-            value: random_value()
-        })).is_err());
+        assert!(v
+            .perform_one_operation(&Operation::Insert(KeyValue {
+                key,
+                value: random_value()
+            }))
+            .is_err());
         assert!(v.digest().is_none()); // verification succeeded when it should have failed because of the wrong key
-                                                         // put the key back the way it should be, because otherwise it's messed up in the prover tree
+                                       // put the key back the way it should be, because otherwise it's messed up in the prover tree
     }
 }
 
@@ -1691,35 +1691,40 @@ fn test_verifier_calculate_same_digest() {
 
 #[test]
 fn remove_nodes_benchmark() {
-    let start_tree_size:usize = 100000;
-    let iterations:usize = 100;
-    let to_remove_size:usize = 1000;
-    let to_insert_size:usize = 1000;
-	let (mut prover, elements) = generate_and_populate_prover(start_tree_size);
-	let now = Instant::now();
+    let start_tree_size: usize = 100000;
+    let iterations: usize = 100;
+    let to_remove_size: usize = 1000;
+    let to_insert_size: usize = 1000;
+    let (mut prover, elements) = generate_and_populate_prover(start_tree_size);
+    let now = Instant::now();
 
-	for i in 0..iterations {
-		let mut to_remove: Vec<Operation> = elements[i*to_remove_size..(i+1)*to_remove_size]
-			.iter()
-			.map(|kv| Operation::Remove(kv.key.clone()))
-			.collect();
-		let to_insert: Vec<Operation> = (0..to_insert_size).map(|j| {
-			let k = sha256(&format!("{}-{}", i, j));
-			Operation::Insert(KeyValue{key:k.clone(), value:Bytes::copy_from_slice(&k[..8])})
-		}).collect();
+    for i in 0..iterations {
+        let mut to_remove: Vec<Operation> = elements[i * to_remove_size..(i + 1) * to_remove_size]
+            .iter()
+            .map(|kv| Operation::Remove(kv.key.clone()))
+            .collect();
+        let to_insert: Vec<Operation> = (0..to_insert_size)
+            .map(|j| {
+                let k = sha256(&format!("{}-{}", i, j));
+                Operation::Insert(KeyValue {
+                    key: k.clone(),
+                    value: Bytes::copy_from_slice(&k[..8]),
+                })
+            })
+            .collect();
 
         let mut mods = to_insert;
         mods.append(&mut to_remove);
 
-		let non_modifying_proof = prover.generate_proof_for_operations(&mods).unwrap().0;
-		mods.iter()
-			.for_each(|op| assert!(prover.perform_one_operation(op).is_ok()));
+        let non_modifying_proof = prover.generate_proof_for_operations(&mods).unwrap().0;
+        mods.iter()
+            .for_each(|op| assert!(prover.perform_one_operation(op).is_ok()));
 
-		let removed_nodes = prover.removed_nodes();
-		let _removed_nodes_length = removed_nodes.len();
+        let removed_nodes = prover.removed_nodes();
+        let _removed_nodes_length = removed_nodes.len();
 
-		let proof_bytes = prover.generate_proof();
-		assert_eq!(non_modifying_proof, proof_bytes);
+        let proof_bytes = prover.generate_proof();
+        assert_eq!(non_modifying_proof, proof_bytes);
     }
-	println!("Elapsed time: {:?}", now.elapsed());
+    println!("Elapsed time: {:?}", now.elapsed());
 }

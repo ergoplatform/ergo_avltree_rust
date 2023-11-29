@@ -1,7 +1,6 @@
 use anyhow::*;
 use blake2::digest::{Update, VariableOutput};
 use blake2::VarBlake2b;
-use sha2::{Sha256,Digest};
 use bytes::Bytes;
 use rand::prelude::*;
 use scorex_crypto_avltree::authenticated_tree_ops::*;
@@ -10,6 +9,7 @@ use scorex_crypto_avltree::batch_avl_verifier::*;
 use scorex_crypto_avltree::batch_node::*;
 use scorex_crypto_avltree::operation::*;
 use scorex_crypto_avltree::versioned_avl_storage::*;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -21,8 +21,18 @@ pub const TEST_ITERATIONS: usize = 10;
 pub const MIN_KEY: [u8; KEY_LENGTH] = [0u8; KEY_LENGTH];
 pub const MAX_KEY: [u8; KEY_LENGTH] = [0xFFu8; KEY_LENGTH];
 
+pub fn random_key_with_len(len: usize) -> ADKey {
+    let key = (0..len).map(|_| rand::random::<u8>()).collect();
+    // let key = Bytes::copy_from_slice(&rand::random::<[u8; len]>());
+    if key < Bytes::from(MIN_KEY.to_vec()) || key > Bytes::from(MAX_KEY.to_vec()) {
+        random_key_with_len(len)
+    } else {
+        key
+    }
+}
+
 pub fn random_key() -> ADKey {
-    Bytes::copy_from_slice(&rand::random::<[u8; KEY_LENGTH]>())
+    random_key_with_len(KEY_LENGTH)
 }
 
 pub fn random_value() -> ADValue {
@@ -222,5 +232,5 @@ impl Iterator for RollbackVersionIterator {
 pub fn sha256(data: &str) -> Bytes {
     let mut hasher = Sha256::new();
     hasher.write(data.as_bytes()).unwrap();
-	Bytes::copy_from_slice(&hasher.finalize())
+    Bytes::copy_from_slice(&hasher.finalize())
 }

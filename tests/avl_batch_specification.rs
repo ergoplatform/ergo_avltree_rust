@@ -1,11 +1,11 @@
 use bytes::Bytes;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use scorex_crypto_avltree::authenticated_tree_ops::*;
-use scorex_crypto_avltree::batch_avl_verifier::BatchAVLVerifier;
-use scorex_crypto_avltree::batch_node::*;
-use scorex_crypto_avltree::operation::*;
-use scorex_crypto_avltree::persistent_batch_avl_prover::*;
+use ergo_avltree_rust::authenticated_tree_ops::*;
+use ergo_avltree_rust::batch_avl_verifier::BatchAVLVerifier;
+use ergo_avltree_rust::batch_node::*;
+use ergo_avltree_rust::operation::*;
+use ergo_avltree_rust::persistent_batch_avl_prover::*;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;

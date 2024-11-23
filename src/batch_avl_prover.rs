@@ -1,11 +1,13 @@
 use crate::authenticated_tree_ops::*;
 use crate::batch_node::*;
 use crate::operation::*;
+use alloc::vec;
+use alloc::vec::Vec;
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
+use core::cmp::Ordering;
 use rand::prelude::*;
 use rand::RngCore;
-use std::cmp::Ordering;
 
 ///
 /// Implements the batch AVL prover from https://eprint.iacr.org/2016/994
@@ -334,7 +336,7 @@ impl BatchAVLProver {
                         && r.balance <= 1
                         && r.balance == (right_height as i8 - left_height as i8)
                 );
-                let height = std::cmp::max(left_height, right_height) + 1;
+                let height = core::cmp::max(left_height, right_height) + 1;
                 (min_left, max_right, height)
             }
             _ => (r_node.clone(), r_node.clone(), 0),

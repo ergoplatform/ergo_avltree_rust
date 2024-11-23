@@ -1,6 +1,7 @@
 use crate::authenticated_tree_ops::*;
 use crate::batch_node::*;
 use crate::operation::*;
+use alloc::vec::Vec;
 use anyhow::*;
 use byteorder::{BigEndian, ByteOrder};
 use bytes::Bytes;
@@ -73,7 +74,7 @@ impl BatchAVLVerifier {
             }
 
             // compute maximum height that the tree can be before an operation
-            temp = 1 + std::cmp::max(self.base.tree.height, log_num_ops);
+            temp = 1 + core::cmp::max(self.base.tree.height, log_num_ops);
             let hnew = temp + temp / 2; // this will replace 1.4405 from the paper with 1.5 and will round down, which is safe, because hnew is an integer
             let real_max_deletes = self.max_deletes.unwrap_or(real_num_operations);
             // Note: this is quite likely a lot more than there will really be nodes
@@ -155,13 +156,19 @@ impl BatchAVLVerifier {
     ///
     pub fn perform_one_operation(&mut self, operation: &Operation) -> Result<Option<ADValue>> {
         self.replay_index = self.directions_index;
-		let root = self.base.tree.root.as_ref().ok_or(anyhow!("Empty tree"))?.clone();
-		let res = self.return_result_of_one_operation(operation, &root);
-		if res.is_err() {
-			self.base.tree.root = None;
-			self.base.tree.height = 0;
-		}
-		res
+        let root = self
+            .base
+            .tree
+            .root
+            .as_ref()
+            .ok_or(anyhow!("Empty tree"))?
+            .clone();
+        let res = self.return_result_of_one_operation(operation, &root);
+        if res.is_err() {
+            self.base.tree.root = None;
+            self.base.tree.height = 0;
+        }
+        res
     }
 }
 
@@ -209,7 +216,7 @@ impl AuthenticatedTreeOps for BatchAVLVerifier {
         // checks that the key is either equal to the leaf's key
         // or is between the leaf's key and its nextLeafKey
         // See https://eprint.iacr.org/2016/994 Appendix B paragraph "Our Algorithms"
-		let leaf_key = leaf.hdr.key.as_ref().unwrap();
+        let leaf_key = leaf.hdr.key.as_ref().unwrap();
         if *key == *leaf_key {
             Ok(true)
         } else {

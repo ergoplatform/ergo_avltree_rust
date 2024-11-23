@@ -3,6 +3,8 @@ use crate::batch_avl_prover::*;
 use crate::batch_node::*;
 use crate::operation::*;
 use crate::versioned_avl_storage::*;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use anyhow::{ensure, Result};
 
 pub struct PersistentBatchAVLProver {

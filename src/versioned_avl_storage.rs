@@ -1,8 +1,10 @@
 use crate::batch_avl_prover::*;
 use crate::batch_node::*;
 use crate::operation::*;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use anyhow::Result;
-use std::iter::Iterator;
+use core::iter::Iterator;
 
 ///
 /// Interface for persistent versioned

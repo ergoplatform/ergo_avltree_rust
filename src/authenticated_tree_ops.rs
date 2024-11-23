@@ -1,5 +1,6 @@
 use crate::batch_node::*;
 use crate::operation::*;
+use alloc::vec::Vec;
 use bytes::{BufMut, BytesMut};
 
 use anyhow::*;

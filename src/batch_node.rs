@@ -1,12 +1,14 @@
 use crate::operation::*;
-use blake2::digest::{Update, VariableOutput};
-use blake2::VarBlake2b;
+use alloc::vec;
+use alloc::vec::Vec;
+use blake2::digest::Digest;
+use blake2::Blake2b;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::cell::RefCell;
+use core::cell::RefCell;
 //use debug_cell::RefCell;
-use std::cmp::Ordering;
-use std::fmt;
-use std::rc::Rc;
+use alloc::rc::Rc;
+use core::cmp::Ordering;
+use core::fmt;
 
 // Do not use bytes -1, 0, or 1 -- these are for balance
 pub(crate) const LEAF_IN_PACKAGED_PROOF: u8 = 2;
@@ -17,6 +19,7 @@ pub type Balance = i8;
 pub type SerializedAdProof = Bytes;
 pub type NodeId = Rc<RefCell<Node>>;
 pub type Resolver = fn(&Digest32) -> Node;
+pub type Blake2b256 = Blake2b<blake2::digest::typenum::U32>;
 
 #[derive(Debug, Clone)]
 pub struct NodeHeader {
@@ -84,24 +87,24 @@ impl Node {
         match self {
             Node::LabelOnly(hdr) => hdr.label.unwrap(),
             Node::Leaf(node) => {
-                let mut hasher = VarBlake2b::new(32).unwrap();
+                let mut hasher = Blake2b256::new();
                 hasher.update(&[0u8; 1]);
                 hasher.update(&node.hdr.key.as_ref().unwrap()[..]);
                 hasher.update(&node.value[..]);
                 hasher.update(&node.next_node_key[..]);
                 let mut label: Digest32 = Default::default();
-                label.copy_from_slice(&hasher.finalize_boxed());
+                label.copy_from_slice(&hasher.finalize());
                 node.hdr.label = Some(label);
                 label
             }
             Node::Internal(node) => {
-                let mut hasher = VarBlake2b::new(32).unwrap();
+                let mut hasher = Blake2b256::new();
                 hasher.update(&[1u8; 1]);
                 hasher.update(&[node.balance as u8; 1]);
                 hasher.update(node.left.borrow_mut().label());
                 hasher.update(node.right.borrow_mut().label());
                 let mut label: Digest32 = Default::default();
-                label.copy_from_slice(&hasher.finalize_boxed());
+                label.copy_from_slice(&hasher.finalize());
                 node.hdr.label = Some(label);
                 label
             }

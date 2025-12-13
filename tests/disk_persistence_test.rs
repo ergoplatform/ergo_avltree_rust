@@ -1,12 +1,12 @@
 #[cfg(all(test, feature = "disk-persistence"))]
 mod disk_persistence_tests {
     use bytes::Bytes;
-    use ergo_avltree_rust::authenticated_tree_ops::*;
     use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
     use ergo_avltree_rust::batch_node::*;
     use ergo_avltree_rust::operation::*;
     use ergo_avltree_rust::persistent_batch_avl_prover::*;
     use ergo_avltree_rust::storage::DiskBackedAVLStorage;
+    use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
     use std::boxed::Box;
     use tempfile::TempDir;
 
@@ -21,14 +21,11 @@ mod disk_persistence_tests {
         (temp_dir, storage)
     }
 
-    fn dummy_resolver(_: &[u8; 32]) -> Node {
-        Node::LabelOnly(NodeHeader::new(Some([0u8; 32]), None))
-    }
-
     #[test]
     fn test_basic_disk_persistence() {
         let (_temp_dir, storage) = create_test_storage(32, Some(8));
-        let tree = AVLTree::new(dummy_resolver, 32, Some(8));
+        let resolver = DiskBackedAVLStorage::get_resolver();
+        let tree = AVLTree::new(resolver, 32, Some(8));
         let prover = BatchAVLProver::new(tree, true);
 
         let mut persistent_prover =
@@ -62,7 +59,8 @@ mod disk_persistence_tests {
     #[test]
     fn test_multiple_operations_and_versions() {
         let (_temp_dir, storage) = create_test_storage(32, Some(8));
-        let tree = AVLTree::new(dummy_resolver, 32, Some(8));
+        let resolver = DiskBackedAVLStorage::get_resolver();
+        let tree = AVLTree::new(resolver, 32, Some(8));
         let prover = BatchAVLProver::new(tree, true);
 
         let mut persistent_prover =
@@ -151,7 +149,8 @@ mod disk_persistence_tests {
         // First session: create and populate tree
         {
             let storage = Box::new(DiskBackedAVLStorage::new(&path, 32, Some(8), 10).unwrap());
-            let tree = AVLTree::new(dummy_resolver, 32, Some(8));
+            let resolver = DiskBackedAVLStorage::get_resolver();
+            let tree = AVLTree::new(resolver, 32, Some(8));
             let prover = BatchAVLProver::new(tree, true);
             let mut persistent_prover =
                 PersistentBatchAVLProver::new(prover, storage, vec![]).unwrap();
@@ -175,7 +174,7 @@ mod disk_persistence_tests {
             assert_eq!(storage.version(), Some(digest1.clone()));
 
             // Create new prover with existing storage
-            let resolver = storage.create_resolver();
+            let resolver = DiskBackedAVLStorage::get_resolver();
             let tree = AVLTree::new(resolver, 32, Some(8));
             let prover = BatchAVLProver::new(tree, true);
             let mut persistent_prover =
@@ -193,7 +192,8 @@ mod disk_persistence_tests {
     #[test]
     fn test_remove_operations() {
         let (_temp_dir, storage) = create_test_storage(32, Some(8));
-        let tree = AVLTree::new(dummy_resolver, 32, Some(8));
+        let resolver = DiskBackedAVLStorage::get_resolver();
+        let tree = AVLTree::new(resolver, 32, Some(8));
         let prover = BatchAVLProver::new(tree, true);
 
         let mut persistent_prover =
@@ -250,14 +250,15 @@ mod disk_persistence_tests {
     #[test]
     fn test_large_tree_persistence() {
         let (_temp_dir, storage) = create_test_storage(32, Some(8));
-        let tree = AVLTree::new(dummy_resolver, 32, Some(8));
+        let resolver = DiskBackedAVLStorage::get_resolver();
+        let tree = AVLTree::new(resolver, 32, Some(8));
         let prover = BatchAVLProver::new(tree, true);
 
         let mut persistent_prover =
             PersistentBatchAVLProver::new(prover, storage, vec![]).unwrap();
 
         // Insert 1000 keys
-        for i in 0..1000u32 {
+        for i in 1..1001u32 {
             let mut key = vec![0u8; 32];
             key[28..32].copy_from_slice(&i.to_be_bytes());
             let key = Bytes::from(key);
@@ -276,7 +277,7 @@ mod disk_persistence_tests {
         let digest = persistent_prover.digest();
 
         // Verify some random keys
-        for i in [0, 100, 500, 999] {
+        for i in [1u32, 100, 500, 1000] {
             let mut key = vec![0u8; 32];
             key[28..32].copy_from_slice(&i.to_be_bytes());
             let key = Bytes::from(key);
@@ -299,7 +300,8 @@ mod disk_persistence_tests {
     #[test]
     fn test_update_long_by_operation() {
         let (_temp_dir, storage) = create_test_storage(32, Some(8));
-        let tree = AVLTree::new(dummy_resolver, 32, Some(8));
+        let resolver = DiskBackedAVLStorage::get_resolver();
+        let tree = AVLTree::new(resolver, 32, Some(8));
         let prover = BatchAVLProver::new(tree, true);
 
         let mut persistent_prover =

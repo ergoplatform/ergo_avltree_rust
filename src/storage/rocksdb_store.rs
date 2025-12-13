@@ -15,8 +15,6 @@ const CF_META: &str = "meta";
 
 const KEY_CURRENT_VERSION: &[u8] = b"__current_version__";
 const KEY_LSN_COUNTER: &[u8] = b"__lsn_counter__";
-const KEY_ROOT_HASH: &[u8] = b"__root_hash__";
-const KEY_ROOT_HEIGHT: &[u8] = b"__root_height__";
 
 type LSN = u64;
 
@@ -185,20 +183,6 @@ impl VersionedRocksDBStore {
         Ok(next)
     }
 
-    fn save_undo_record(&mut self, record: &UndoRecord) -> Result<()> {
-        let db = self.store.db.write();
-        let cf = db
-            .cf_handle(CF_UNDO)
-            .ok_or_else(|| StorageError::DatabaseError("CF undo not found".to_string()))?;
-
-        // Use inverted LSN as key for descending order iteration
-        let inverted_lsn = !record.lsn;
-        let key = inverted_lsn.to_be_bytes();
-        let value = bincode::serialize(record)?;
-        db.put_cf(cf, key, value)?;
-        Ok(())
-    }
-
     fn get_undo_records_for_version(&self, target_version: &[u8]) -> Result<Vec<UndoRecord>> {
         let db = self.store.db.read();
         let cf = db
@@ -319,6 +303,9 @@ impl VersionedKVStore for VersionedRocksDBStore {
         // Update current version
         wb.put_cf(cf_meta, KEY_CURRENT_VERSION, version);
 
+        // Update LSN counter to the end of this batch
+        wb.put_cf(cf_meta, KEY_LSN_COUNTER, lsn.to_be_bytes());
+
         db.write(wb)?;
         drop(db);
 
@@ -347,9 +334,24 @@ impl VersionedKVStore for VersionedRocksDBStore {
             return Ok(()); // Already at target version
         }
 
-        // Get all undo records from current to target
-        let records = self.get_undo_records_for_version(version)?;
+        // Find index of target version
+        let target_idx = self.version_history.iter().position(|v| v == version).unwrap();
 
+        // Versions to undo: from end down to target_idx + 1
+        let mut versions_to_undo = Vec::new();
+        for i in (target_idx + 1..self.version_history.len()).rev() {
+             versions_to_undo.push(self.version_history[i].clone());
+        }
+
+        // Collect all records first
+        // We need to do this before taking the write lock on db
+        let mut all_records = Vec::new();
+        for v in versions_to_undo {
+            let records = self.get_undo_records_for_version(&v)?;
+            all_records.extend(records);
+        }
+        
+        // Re-acquire write lock
         let db = self.store.db.write();
         let cf_main = db
             .cf_handle(CF_MAIN)
@@ -357,11 +359,14 @@ impl VersionedKVStore for VersionedRocksDBStore {
         let cf_meta = db
             .cf_handle(CF_META)
             .ok_or_else(|| StorageError::DatabaseError("CF meta not found".to_string()))?;
-
+            
         let mut wb = WriteBatch::default();
 
-        // Apply undo operations in reverse
-        for record in records.iter().rev() {
+        // Apply undo operations
+        // all_records contains records from latest version to oldest (above target).
+        // Within each version, records are sorted by LSN descending.
+        // So iterating all_records is correct order.
+        for record in all_records {
             match &record.old_value {
                 Some(value) => {
                     wb.put_cf(cf_main, &record.key, value);
@@ -376,6 +381,9 @@ impl VersionedKVStore for VersionedRocksDBStore {
         wb.put_cf(cf_meta, KEY_CURRENT_VERSION, version);
 
         db.write(wb)?;
+        
+        // Update history
+        self.version_history.truncate(target_idx + 1);
 
         Ok(())
     }

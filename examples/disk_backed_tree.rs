@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
     )?);
 
     // Create resolver for lazy loading
-    let resolver = storage.create_resolver();
+    let resolver = DiskBackedAVLStorage::get_resolver();
 
     // Create AVL tree with disk resolver
     let tree = AVLTree::new(resolver, key_length, value_length);

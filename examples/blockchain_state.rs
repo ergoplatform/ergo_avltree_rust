@@ -8,7 +8,6 @@
 //! - Database persistence and recovery
 
 use bytes::Bytes;
-use ergo_avltree_rust::authenticated_tree_ops::*;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::batch_node::*;
 use ergo_avltree_rust::operation::*;
@@ -22,14 +21,6 @@ struct Transaction {
     from: Vec<u8>,
     to: Vec<u8>,
     amount: u64,
-}
-
-// Block containing transactions
-#[derive(Debug)]
-struct Block {
-    height: u32,
-    transactions: Vec<Transaction>,
-    state_digest: Option<Bytes>,
 }
 
 fn main() -> anyhow::Result<()> {

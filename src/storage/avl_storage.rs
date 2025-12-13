@@ -120,6 +120,10 @@ impl DiskBackedAVLStorage {
         tree: &AVLTree,
         result: &mut Vec<(Vec<u8>, Vec<u8>)>,
     ) {
+        if matches!(&*node.borrow(), Node::LabelOnly(_)) {
+            return;
+        }
+
         let is_internal = matches!(&*node.borrow(), Node::Internal(_));
         let label = node.borrow().get_label();
         

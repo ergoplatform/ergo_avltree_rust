@@ -8,7 +8,6 @@
 //! - Reopening the database
 
 use bytes::Bytes;
-use ergo_avltree_rust::authenticated_tree_ops::*;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::batch_node::*;
 use ergo_avltree_rust::operation::*;
@@ -63,7 +62,7 @@ fn main() -> anyhow::Result<()> {
         });
 
         persistent_prover.perform_one_operation(&op)?;
-        println!("Inserted key {:?} with value: {}", &key[30..], i * 100);
+        println!("Inserted key {:?} with value: {}", &key[30..], i as u64 * 100);
     }
 
     // Commit to disk

@@ -10,6 +10,7 @@ use ergo_avltree_rust::versioned_avl_storage::*;
 use rand::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub const INITIAL_TREE_SIZE: usize = 1000;
 pub const KEY_LENGTH: usize = 32;
@@ -97,7 +98,7 @@ pub fn generate_verifier(
 }
 
 pub fn generate_tree(key_length: usize, value_length: Option<usize>) -> AVLTree {
-    AVLTree::new(dummy_resolver, key_length, value_length)
+    AVLTree::new(Arc::new(dummy_resolver), key_length, value_length)
 }
 
 pub fn generate_prover(key_length: usize, value_length: Option<usize>) -> BatchAVLProver {

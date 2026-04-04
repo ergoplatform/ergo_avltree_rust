@@ -18,7 +18,7 @@ pub(crate) const END_OF_TREE_IN_PACKAGED_PROOF: u8 = 4;
 pub type Balance = i8;
 pub type SerializedAdProof = Bytes;
 pub type NodeId = Rc<RefCell<Node>>;
-pub type Resolver = fn(&Digest32) -> Node;
+pub type Resolver = alloc::sync::Arc<dyn Fn(&Digest32) -> Node + Send + Sync>;
 pub type Blake2b256 = Blake2b<blake2::digest::typenum::U32>;
 
 #[derive(Debug, Clone)]

@@ -53,4 +53,17 @@ pub trait VersionedAVLStorage {
     /// @return versions store keeps
     ///
     fn rollback_versions<'a>(&'a self) -> Box<dyn Iterator<Item = ADDigest> + 'a>;
+
+    ////
+    /// Force a durable commit of outstanding writes. Implementations that
+    /// use deferred/non-durable writes (e.g. `Durability::None` in redb)
+    /// should fsync the backing store here. Default is a no-op for
+    /// in-memory or always-durable storages.
+    ///
+    /// Callers should invoke this periodically during long-running write
+    /// sequences and on graceful shutdown to bound crash data loss.
+    ///
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
 }

@@ -114,8 +114,73 @@ Here are code examples for generating proofs and checking them. In this example 
   }
 ```
 
+## Persistent Storage (Versioned Database)
+
+This crate provides an optional `redb`-backed persistent storage layer implementing the `VersionedAVLStorage` trait. It features an **undo-log architecture** for fast rollbacks and history navigation, mirroring the Scala `LDBVersionedStore`.
+
+The core crate is `#![no_std]`. To enable persistence, add the `persistence` feature:
+
+```toml
+[dependencies]
+ergo_avltree_rust = { version = "0.1", features = ["persistence"] }
+```
+
+### Architecture
+
+- **`RedbVersionedStore`** — Low-level versioned key-value store with 4 strictly-typed `redb` tables (`nodes`, `meta`, `undo_log`, `versions`). Each `update()` atomically records compensating undo entries; `rollback()` walks the version chain and applies them in reverse.
+- **`RedbAVLStorage`** — Implements `VersionedAVLStorage`. Bridges the AVL tree to the versioned store using the existing `pack()`/`unpack()` serialization. Provides a `Resolver` closure backed by the database for lazy node loading.
+- **Zero write amplification** — Nodes are content-addressed by their Blake2b hash. Unchanged nodes skip DB writes entirely.
+- **Pure Rust** — No C/C++ dependencies (unlike RocksDB/LevelDB). Simplifies cross-compilation and future WASM integration.
+
+### Example
+
+```rust
+use std::sync::Arc;
+use std::path::Path;
+use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
+use ergo_avltree_rust::batch_node::*;
+use ergo_avltree_rust::operation::*;
+use ergo_avltree_rust::persistence::RedbAVLStorage;
+use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
+
+// Open persistent storage (creates DB file if needed)
+let mut storage = RedbAVLStorage::open(
+    Path::new("/path/to/avl_state.redb"),
+    32,       // key_length
+    None,     // value_length (None = variable)
+).unwrap();
+
+// Create prover with DB-backed resolver
+let resolver = storage.create_resolver();
+let tree = AVLTree::new(resolver, 32, None);
+let mut prover = BatchAVLProver::new(tree, true);
+
+// Perform operations
+let key = bytes::Bytes::from(vec![1u8; 32]);
+let val = bytes::Bytes::from("hello");
+prover.perform_one_operation(&Operation::Insert(KeyValue {
+    key: key.clone(), value: val,
+})).unwrap();
+
+// IMPORTANT: Persist state BEFORE generating the proof!
+// generate_proof() clears internal buffers including removed_nodes.
+storage.update(&mut prover, vec![]).unwrap();
+let proof = prover.generate_proof();
+
+// Rollback to a previous version if needed
+// let (root, height) = storage.rollback(&previous_digest).unwrap();
+```
+
+> **⚠️ Critical ordering rule:** Always call `storage.update()` **before** `prover.generate_proof()`. The proof generation consumes and clears the internal mutation buffers. If you generate the proof first, the storage will not be able to track removed nodes, leading to orphaned data in the database.
+
+### Future Work
+
+- **Log compaction:** A `compact(keep_versions: u32)` method to prune undo-log entries beyond a retention window, preventing unbounded DB growth on long-running nodes.
+- **Explicit version IDs:** The current `VersionedAVLStorage` trait uses the tree digest as version ID. A future trait update could accept explicit block IDs for better empty-block handling.
+
 # Tests
 Run `cargo test` from a folder containing the framework to launch tests.
+With persistence: `cargo test --features persistence`
 
 # License
 

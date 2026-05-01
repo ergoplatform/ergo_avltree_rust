@@ -177,18 +177,7 @@ impl RedbVersionedStore {
         Ok(RedbVersionedStore { db })
     }
 
-    /// Read the current next_lsn from meta. Returns 0 if not set.
-    fn read_next_lsn(&self) -> Result<u64> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(META_TABLE)?;
-        match table.get(META_NEXT_LSN)? {
-            Some(v) => {
-                let bytes: &[u8] = v.value();
-                Ok(u64::from_le_bytes(bytes.try_into()?))
-            }
-            None => Ok(0),
-        }
-    }
+
 
     /// Get the last version ID, or None if store is empty.
     pub fn last_version_id(&self) -> Result<Option<Vec<u8>>> {
@@ -222,16 +211,23 @@ impl RedbVersionedStore {
         to_insert: &[(&[u8], &[u8])],
         to_remove: &[&[u8]],
     ) -> Result<()> {
-        let mut next_lsn = self.read_next_lsn()?;
-        let start_lsn = next_lsn;
-        let parent_version = self.last_version_id()?;
-
         let txn = self.db.begin_write()?;
         {
             let mut nodes = txn.open_table(NODES_TABLE)?;
             let mut undo_log = txn.open_table(UNDO_LOG_TABLE)?;
             let mut meta = txn.open_table(META_TABLE)?;
             let mut versions = txn.open_table(VERSIONS_TABLE)?;
+
+            // Read next_lsn and parent version INSIDE the write txn (Q4 TOCTOU fix)
+            let mut next_lsn = meta.get(META_NEXT_LSN)?
+                .map(|v| {
+                    let bytes: [u8; 8] = v.value().try_into().unwrap();
+                    u64::from_le_bytes(bytes)
+                })
+                .unwrap_or(0);
+            let start_lsn = next_lsn;
+            let parent_version = meta.get(META_LAST_VERSION)?
+                .map(|v| v.value().to_vec());
 
             // Record undo entries for removals
             for key in to_remove {

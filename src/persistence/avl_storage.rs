@@ -14,7 +14,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // Special keys in the node store for tree metadata
 const TOP_NODE_HASH_KEY: &[u8] = b"__top_node_hash__";
@@ -26,17 +26,13 @@ const TOP_NODE_HEIGHT_KEY: &[u8] = b"__top_node_height__";
 /// and `AVLTree::unpack()` methods for node serialization, and `RedbVersionedStore`
 /// for versioned persistence with rollback.
 pub struct RedbAVLStorage {
-    store: RedbVersionedStore,
-    db_path: PathBuf,
+    store: Arc<RedbVersionedStore>,
     key_length: usize,
     value_length: Option<usize>,
 }
 
 impl RedbAVLStorage {
     /// Create a new persistent AVL storage at the given path.
-    ///
-    /// - `key_length`: fixed key length for the AVL tree
-    /// - `value_length`: optional fixed value length (None for variable-length values)
     pub fn open(
         path: &Path,
         key_length: usize,
@@ -44,8 +40,7 @@ impl RedbAVLStorage {
     ) -> Result<Self> {
         let store = RedbVersionedStore::open(path)?;
         Ok(RedbAVLStorage {
-            store,
-            db_path: path.to_path_buf(),
+            store: Arc::new(store),
             key_length,
             value_length,
         })
@@ -53,32 +48,18 @@ impl RedbAVLStorage {
 
     /// Create a `Resolver` closure that loads nodes from this storage.
     ///
-    /// The resolver panics if a requested hash is not found — this indicates
-    /// database corruption (the hash was referenced but the node data is missing).
+    /// Uses a shared `Arc<RedbVersionedStore>` — no file re-opening per call.
+    /// Panics if a requested hash is not found (= database corruption).
     pub fn create_resolver(&self) -> Resolver {
-        let path = self.db_path.clone();
+        let store = Arc::clone(&self.store);
         let key_length = self.key_length;
         let value_length = self.value_length;
 
         Arc::new(move |digest: &Digest32| {
-            // Open a read-only handle to the DB.
-            // redb supports concurrent readers safely.
-            let db = redb::Database::open(&path)
-                .expect("Failed to open DB in resolver");
-            let txn = db.begin_read()
-                .expect("Failed to begin read txn in resolver");
-            let table = txn
-                .open_table(redb::TableDefinition::<&[u8], &[u8]>::new("nodes"))
-                .expect("Failed to open nodes table in resolver");
-
-            match table.get(digest.as_slice()) {
-                Ok(Some(guard)) => {
-                    let bytes = Bytes::copy_from_slice(guard.value());
-                    drop(guard);
-                    drop(table);
-                    drop(txn);
-
-                    // Create a temporary AVLTree just for deserialization
+            match store.get_node(digest.as_slice()) {
+                Ok(Some(data)) => {
+                    let bytes = Bytes::from(data);
+                    // Temporary AVLTree for deserialization only
                     let dummy_resolver: Resolver = Arc::new(|d: &Digest32| {
                         Node::LabelOnly(NodeHeader::new(Some(*d), None))
                     });
@@ -89,7 +70,7 @@ impl RedbAVLStorage {
                 }
                 Ok(None) => {
                     panic!(
-                        "Node not found in DB for digest {:02x}{:02x}{:02x}{:02x}... — database is corrupted",
+                        "Node not found in DB for digest {:02x}{:02x}{:02x}{:02x}... -- database is corrupted",
                         digest[0], digest[1], digest[2], digest[3]
                     );
                 }
@@ -100,8 +81,8 @@ impl RedbAVLStorage {
         })
     }
 
-    /// Collect all nodes from the tree by walking it recursively.
-    /// Returns (label, packed_bytes) pairs for all nodes in the tree.
+    /// Collect all resolved nodes from the tree by walking it recursively.
+    /// Returns (label, packed_bytes) pairs for visited (non-LabelOnly) nodes.
     fn collect_all_nodes(
         tree: &AVLTree,
         node: &NodeId,
@@ -141,7 +122,7 @@ impl VersionedAVLStorage for RedbAVLStorage {
         let tree = prover.get_tree();
         let root = prover.top_node();
 
-        // Collect all nodes to persist
+        // Collect all resolved nodes
         let mut node_pairs = Vec::new();
         Self::collect_all_nodes(tree, &root, &mut node_pairs);
 
@@ -149,13 +130,19 @@ impl VersionedAVLStorage for RedbAVLStorage {
         let height = tree.height;
         let root_label = root.borrow_mut().label();
         let height_bytes = (height as u64).to_le_bytes();
-
-        // Build insert list: all nodes + metadata
-        let mut to_insert: Vec<(&[u8], &[u8])> = node_pairs
-            .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
-            .collect();
         let root_label_vec = root_label.to_vec();
+
+        // Q2 FIX: Filter out content-addressed nodes that already exist in DB.
+        // Since keys are Blake2b hashes, if the key exists, the content is
+        // guaranteed identical (content-addressed = idempotent). This eliminates
+        // 100% of write amplification from re-persisting unchanged nodes.
+        let mut to_insert: Vec<(&[u8], &[u8])> = Vec::new();
+        for (key, value) in &node_pairs {
+            if self.store.get_node(key)?.is_none() {
+                to_insert.push((key.as_slice(), value.as_slice()));
+            }
+        }
+        // Metadata keys ALWAYS update (not content-addressed)
         to_insert.push((TOP_NODE_HASH_KEY, root_label_vec.as_slice()));
         to_insert.push((TOP_NODE_HEIGHT_KEY, &height_bytes));
 
@@ -174,7 +161,6 @@ impl VersionedAVLStorage for RedbAVLStorage {
     fn rollback(&mut self, version: &ADDigest) -> Result<(NodeId, usize)> {
         self.store.rollback(version)?;
 
-        // Read root hash and height from the store
         let root_hash = self
             .store
             .get_node(TOP_NODE_HASH_KEY)?
@@ -185,7 +171,6 @@ impl VersionedAVLStorage for RedbAVLStorage {
             .ok_or_else(|| anyhow!("Height not found after rollback"))?;
         let height = u64::from_le_bytes(height_bytes.as_slice().try_into()?) as usize;
 
-        // Read the root node from the store
         let root_data = self
             .store
             .get_node(&root_hash)?

@@ -7,4 +7,10 @@ pub mod operation;
 pub mod persistent_batch_avl_prover;
 pub mod versioned_avl_storage;
 
+#[cfg(feature = "persistence")]
+pub mod persistence;
+
 extern crate alloc;
+
+#[cfg(feature = "persistence")]
+extern crate std;

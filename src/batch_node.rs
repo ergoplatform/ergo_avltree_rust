@@ -468,30 +468,68 @@ impl AVLTree {
         key_found: bool,
     ) -> bool {
         if &self.label(node) == label {
-            true
-        } else {
-            if let Node::Internal(r) = &mut *node.borrow_mut() {
-                if key_found {
-                    self.contains_recursive(&self.resolve(&mut r.left), key, label, true)
-                } else {
-                    match (*key).cmp(r.hdr.key.as_ref().unwrap()) {
-                        Ordering::Equal =>
-                        // found in the tree -- go one step right, then left to the leaf
-                        {
-                            self.contains_recursive(&self.resolve(&mut r.right), key, label, true)
-                        }
-                        Ordering::Less =>
-                        // going left, not yet found
-                        {
-                            self.contains_recursive(&self.resolve(&mut r.left), key, label, false)
-                        }
-                        Ordering::Greater => {
-                            self.contains_recursive(&self.resolve(&mut r.right), key, label, false)
+            return true;
+        }
+
+        // Discriminate the node kind in a scoped immutable borrow so we can
+        // re-borrow mutably below for the Internal walk without a conflict.
+        enum Kind {
+            Internal,
+            Leaf,
+            LabelOnly,
+        }
+        let kind = {
+            let n = node.borrow();
+            match &*n {
+                Node::Internal(_) => Kind::Internal,
+                Node::Leaf(_) => Kind::Leaf,
+                Node::LabelOnly(_) => Kind::LabelOnly,
+            }
+        };
+
+        match kind {
+            Kind::Leaf => false,
+            // Reached a LabelOnly that the resolver could not materialize
+            // (digest not in storage). We cannot conclude whether the target
+            // label is present in the unresolved subtree, so fail safe by
+            // returning true. Used by `removed_nodes()` to decide what to
+            // delete from storage; treating an unresolvable subtree as
+            // "definitely absent" silently deletes nodes that may still be
+            // referenced from this subtree, producing dangling parent->child
+            // references on disk and later walks bailing with
+            // "should never reach this point".
+            Kind::LabelOnly => true,
+            Kind::Internal => {
+                if let Node::Internal(r) = &mut *node.borrow_mut() {
+                    if key_found {
+                        self.contains_recursive(&self.resolve(&mut r.left), key, label, true)
+                    } else {
+                        match (*key).cmp(r.hdr.key.as_ref().unwrap()) {
+                            // found in the tree -- go one step right, then left to the leaf
+                            Ordering::Equal => self.contains_recursive(
+                                &self.resolve(&mut r.right),
+                                key,
+                                label,
+                                true,
+                            ),
+                            // going left, not yet found
+                            Ordering::Less => self.contains_recursive(
+                                &self.resolve(&mut r.left),
+                                key,
+                                label,
+                                false,
+                            ),
+                            Ordering::Greater => self.contains_recursive(
+                                &self.resolve(&mut r.right),
+                                key,
+                                label,
+                                false,
+                            ),
                         }
                     }
+                } else {
+                    unreachable!("kind already verified Internal")
                 }
-            } else {
-                false
             }
         }
     }

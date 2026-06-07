@@ -326,11 +326,18 @@ pub struct AVLTree {
 }
 
 impl AVLTree {
-    pub fn new(resolver: Resolver, key_length: usize, value_length: Option<usize>) -> AVLTree {
+    /// Accepts any closure (wrapped into the `Arc` internally), so callers written
+    /// against the old `Resolver = fn(&Digest32) -> Node` signature compile unchanged.
+    /// To reuse a prebuilt [`Resolver`], construct the struct literally (`resolver` is pub).
+    pub fn new(
+        resolver: impl Fn(&Digest32) -> Node + Send + Sync + 'static,
+        key_length: usize,
+        value_length: Option<usize>,
+    ) -> AVLTree {
         AVLTree {
             key_length,
             value_length,
-            resolver,
+            resolver: alloc::sync::Arc::new(resolver),
             height: 0,
             root: None,
         }

@@ -470,7 +470,7 @@ mod tests {
     fn empty_digest_hash_is_correct() {
         let prover = BatchAVLProver::new(
             AVLTree::new(
-                alloc::sync::Arc::new(|digest: &Digest32| Node::LabelOnly(NodeHeader::new(Some(*digest), None))),
+                |digest: &Digest32| Node::LabelOnly(NodeHeader::new(Some(*digest), None)),
                 32,
                 None,
             ),

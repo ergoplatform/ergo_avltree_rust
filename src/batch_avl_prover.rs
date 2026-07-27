@@ -41,6 +41,13 @@ pub struct BatchAVLProver {
     // (if so, we know how to get to the leaf without
     //  any further comparisons)
     found: bool, // keeps track of whether the key for the current
+
+    // Set by generate_proof() — the next perform_one_operation() resets
+    // visited/is_new flags so the changed-node buffers gate correctly.
+    // This is the persistence cycle boundary; proof generation uses
+    // modified_nodes (cleared separately) so stale old_top_node flags
+    // don't affect it.
+    needs_cycle_reset: bool,
 }
 
 impl BatchAVLProver {
@@ -53,6 +60,7 @@ impl BatchAVLProver {
             last_right_step: 0,
             old_top_node: None,
             found: false,
+            needs_cycle_reset: false,
         };
         if prover.base.tree.root.is_none() {
             let t = LeafNode::new(
@@ -79,6 +87,10 @@ impl BatchAVLProver {
     /// @return - Success(Some(old value)), Success(None), or Failure
     ////
     pub fn perform_one_operation(&mut self, operation: &Operation) -> Result<Option<ADValue>> {
+        if self.needs_cycle_reset {
+            self.base.tree.reset();
+            self.needs_cycle_reset = false;
+        }
         self.replay_index = self.directions_bit_length;
         let res = self.return_result_of_one_operation(operation, &self.top_node());
         if res.is_err() {
@@ -117,7 +129,11 @@ impl BatchAVLProver {
         &self,
         operations: &Vec<Operation>,
     ) -> Result<(SerializedAdProof, ADDigest)> {
-        let mut new_prover = BatchAVLProver::new(self.base.tree.clone(), false);
+        // Clone the tree and reset visited/is_new flags so the cloned
+        // prover's on_node_visit gates correctly on fresh flags.
+        let tree_clone = self.base.tree.clone();
+        tree_clone.reset();
+        let mut new_prover = BatchAVLProver::new(tree_clone, false);
         for op in operations.iter() {
             new_prover.perform_one_operation(op)?;
         }
@@ -142,15 +158,16 @@ impl BatchAVLProver {
         packaged_tree: &mut BytesMut,
         previous_leaf_available: &mut bool,
     ) {
-        // Post order traversal to pack up the tree
-        if !self.base.tree.visited(r_node) {
+        // Post order traversal to pack up the tree.
+        // Uses was_modified (tracked separately from persistence flags) so
+        // that proof generation is independent of tree.reset().
+        if !self.base.was_modified(r_node) {
             packaged_tree.put_u8(LABEL_IN_PACKAGED_PROOF);
             let label = self.base.tree.label(r_node);
             packaged_tree.extend_from_slice(&label);
             assert!(label.len() == DIGEST_LENGTH);
             *previous_leaf_available = false;
         } else {
-            self.base.tree.mark_visited(r_node, false);
             match self.base.tree.copy(r_node) {
                 Node::Leaf(leaf) => {
                     packaged_tree.put_u8(LEAF_IN_PACKAGED_PROOF);
@@ -196,7 +213,12 @@ impl BatchAVLProver {
         packaged_tree.extend_from_slice(&self.directions);
 
         // prepare for the next time proof
-        self.base.tree.reset();
+        // Clear proof-generation state (modified_nodes) but NOT the
+        // persistence flags (visited/is_new) — those belong to update().
+        // The next perform_one_operation() will clear those flags via
+        // needs_cycle_reset so changed-node buffers gate correctly.
+        self.base.modified_nodes.clear();
+        self.needs_cycle_reset = true;
         self.directions = Vec::new();
         self.directions_bit_length = 0;
         self.old_top_node = self.base.tree.root.clone();
@@ -316,7 +338,7 @@ impl BatchAVLProver {
 
     fn check_tree_helper(&self, r_node: &NodeId, post_proof: bool) -> (NodeId, NodeId, usize) {
         let node = self.base.tree.copy(r_node);
-        assert!(!post_proof || (!node.visited() && !node.is_new()));
+        let _ = post_proof; // flags are cleared by update() or perform_one_operation(), not generate_proof()
         match node {
             Node::Internal(r) => {
                 let key = r.hdr.key.unwrap();

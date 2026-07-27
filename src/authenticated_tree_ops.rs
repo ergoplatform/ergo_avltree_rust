@@ -1,5 +1,7 @@
 use crate::batch_node::*;
 use crate::operation::*;
+use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 use bytes::{BufMut, BytesMut};
 
@@ -14,6 +16,15 @@ pub struct AuthenticatedTreeOpsBase {
     pub changed_nodes_buffer: Vec<NodeId>,
     pub changed_nodes_buffer_to_check: Vec<NodeId>,
     pub tree: AVLTree,
+    /// Nodes visited during the current operation cycle — used by
+    /// `pack_tree` to decide which subtrees to expand in the proof.
+    /// Separate from the tree's `visited`/`is_new` flags so that
+    /// proof generation and persistence (`collect_changed_nodes`)
+    /// are independently resettable.
+    /// Nodes touched during the current proof-generation cycle, keyed by
+    /// address for sub-linear lookup. The `NodeId` value keeps each node
+    /// alive, so an address cannot be recycled while it is a key.
+    pub modified_nodes: BTreeMap<usize, NodeId>,
 }
 
 impl AuthenticatedTreeOpsBase {
@@ -23,7 +34,15 @@ impl AuthenticatedTreeOpsBase {
             changed_nodes_buffer: Vec::new(),
             changed_nodes_buffer_to_check: Vec::new(),
             tree,
+            modified_nodes: BTreeMap::new(),
         }
+    }
+
+    /// Returns `true` if `node` was visited during the current operation
+    /// cycle and must be expanded (rather than labelled) in the proof.
+    pub fn was_modified(&self, node: &NodeId) -> bool {
+        self.modified_nodes
+            .contains_key(&(Rc::as_ptr(node) as usize))
     }
 }
 
@@ -82,6 +101,8 @@ pub trait AuthenticatedTreeOps {
 
     fn on_node_visit(&mut self, node: &NodeId, operation: &Operation, is_rotate: bool) {
         let this = self.state();
+        this.modified_nodes
+            .insert(Rc::as_ptr(node) as usize, node.clone());
         if this.collect_changed_nodes && !this.tree.visited(node) && !this.tree.is_new(node) {
             if is_rotate {
                 // during rotate operation node may stay in the tree in a different position

@@ -75,6 +75,37 @@ impl BatchAVLProver {
         prover
     }
 
+    /// Install a persisted root and rebase the proof cycle atomically.
+    ///
+    /// Must be called after any operation that replaces `tree.root` with a
+    /// storage-loaded root — startup resume, snapshot bootstrap, and recovery
+    /// rollback. Without this, `old_top_node` is either a stale sentinel
+    /// (fresh construction with an empty tree) or a stale previous-cycle
+    /// root (recovery after a failed apply), and `pack_tree` produces
+    /// wrong proofs.
+    pub fn restore_root(&mut self, root: NodeId, height: usize) {
+        self.base.tree.root = Some(root);
+        self.base.tree.height = height;
+
+        // Clear is_new/visited on the freshly-installed tree.
+        self.base.tree.reset();
+
+        // Drop stale dirty-node bookkeeping from the previous proof cycle.
+        self.base.changed_nodes_buffer.clear();
+        self.base.changed_nodes_buffer_to_check.clear();
+
+        // Rebase the proof baseline to the freshly-restored root.
+        self.old_top_node = self.base.tree.root.clone();
+
+        // Clear accumulated directions from any prior (possibly failed) cycle.
+        self.directions = Vec::new();
+        self.directions_bit_length = 0;
+
+        // We called tree.reset() inline — don't double-reset on the next
+        // perform_one_operation.
+        self.needs_cycle_reset = false;
+    }
+
     ///
     /// If operation.key exists in the tree and the operation succeeds,
     /// returns Success(Some(v)), where v is the value associated with operation.key

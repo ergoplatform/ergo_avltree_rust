@@ -504,8 +504,8 @@ pub trait AuthenticatedTreeOps {
                         // If we are in deleteMax mode,
                         // we should save the info of leaf we are deleting,
                         // because it will be copied over to its successor
-                        *saved_node = Some(r.right);
-                        return Ok((r.left, true));
+                        *saved_node = Some(r.right.clone());
+                        return Ok((r.left.clone(), true));
                     } else {
                         // Otherwise, we really are deleting the leaf, and therefore
                         // we need to change the nextLeafKey of its predecessor

@@ -319,7 +319,7 @@ impl BatchAVLProver {
         assert!(!post_proof || (!node.visited() && !node.is_new()));
         match node {
             Node::Internal(r) => {
-                let key = r.hdr.key.unwrap();
+                let key = r.hdr.key.as_ref().unwrap().clone();
                 if let Node::Internal(rl) = &*r.left.borrow() {
                     assert!(*rl.hdr.key.as_ref().unwrap() < key);
                 }

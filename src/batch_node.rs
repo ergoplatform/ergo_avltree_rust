@@ -349,6 +349,17 @@ impl InternalNode {
 
 impl Drop for InternalNode {
     fn drop(&mut self) {
+        // Distinct shared children cannot become uniquely owned when this
+        // node releases its two edges, so recursive teardown cannot start
+        // here. If both fields alias the same allocation, however, releasing
+        // both edges may drop its strong count to zero.
+        if !Rc::ptr_eq(&self.left, &self.right)
+            && Rc::strong_count(&self.left) > 1
+            && Rc::strong_count(&self.right) > 1
+        {
+            return;
+        }
+
         // A terminal pair can use ordinary Rc teardown. Avoiding a worklist
         // here also keeps manually detached terminal nodes from allocating a
         // nested worklist when they are dropped below.

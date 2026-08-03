@@ -21,7 +21,7 @@ pub fn deep_spine_proof(depth: usize, lookup_directions: bool) -> SerializedAdPr
     }
     proof.push(END_OF_TREE);
     if lookup_directions {
-        proof.extend(core::iter::repeat(0xff).take((depth + 7) / 8));
+        proof.resize(proof.len() + depth.div_ceil(8), 0xff);
     } else {
         proof.push(0xff);
     }

@@ -3,11 +3,14 @@
 use bytes::Bytes;
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_verifier::BatchAVLVerifier;
-use ergo_avltree_rust::batch_node::{Node, NodeId};
+use ergo_avltree_rust::batch_node::{InternalNode, Node, NodeHeader, NodeId};
+use ergo_avltree_rust::operation::Digest32;
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::env;
 use std::mem;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 mod common;
@@ -20,8 +23,39 @@ use deep_spine::{
 };
 
 const CHILD_CASE_ENV: &str = "ERGO_AVLTREE_DROP_CHILD";
+const ALLOCATION_CHILD_ENV: &str = "ERGO_AVLTREE_DROP_ALLOCATION_CHILD";
 const WORKER_STACK: usize = 512 * 1024;
 const INTERIOR_DEPTH: usize = DEEP_DROP_DEPTH / 2;
+
+struct CountingAllocator;
+
+static COUNT_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
+static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let allocation = unsafe { System.alloc(layout) };
+        if !allocation.is_null() && COUNT_ALLOCATIONS.load(Ordering::SeqCst) {
+            ALLOCATION_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+        allocation
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let allocation = unsafe { System.realloc(ptr, layout, new_size) };
+        if !allocation.is_null() && COUNT_ALLOCATIONS.load(Ordering::SeqCst) {
+            ALLOCATION_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+        allocation
+    }
+}
 
 const CASES: &[&str] = &[
     "invalid-digest",
@@ -33,6 +67,7 @@ const CASES: &[&str] = &[
     "verifier-outlives-tree",
     "shared-interior",
     "borrowed-interior",
+    "aliased-children",
 ];
 
 fn verifier() -> BatchAVLVerifier {
@@ -54,6 +89,14 @@ fn left_spine_node(root: &NodeId, depth: usize) -> NodeId {
             _ => panic!("left spine ended before interior node"),
         };
         current = next;
+    }
+    current
+}
+
+fn deep_aliased_tree(depth: usize) -> NodeId {
+    let mut current = Node::new_label(&Digest32::default());
+    for _ in 0..depth {
+        current = InternalNode::new(None, &current, &current, 0);
     }
     current
 }
@@ -124,8 +167,48 @@ fn run_child_case(case: &str) {
             assert_left_spine_depth(&interior, DEEP_DROP_DEPTH - INTERIOR_DEPTH);
             drop(interior);
         }
+        "aliased-children" => drop(deep_aliased_tree(DEEP_DROP_DEPTH)),
         other => panic!("unknown iterative-drop child case: {other}"),
     }
+}
+
+#[test]
+fn shared_distinct_children_drop_allocates_no_worklist() {
+    if env::var_os(ALLOCATION_CHILD_ENV).is_none() {
+        let status = Command::new(env::current_exe().expect("test executable path"))
+            .env(ALLOCATION_CHILD_ENV, "1")
+            .arg("--exact")
+            .arg("shared_distinct_children_drop_allocates_no_worklist")
+            .status()
+            .expect("launch allocation-counting child");
+        assert!(status.success(), "allocation-counting child failed");
+        return;
+    }
+
+    let terminal = Node::new_label(&Digest32::default());
+    let left = InternalNode::new(None, &terminal, &terminal, 0);
+    let right = InternalNode::new(None, &terminal, &terminal, 0);
+    let owned = InternalNode {
+        hdr: NodeHeader::new(None, None),
+        balance: 0,
+        left: left.clone(),
+        right: right.clone(),
+    };
+
+    assert!(!Rc::ptr_eq(&owned.left, &owned.right));
+    assert_eq!(Rc::strong_count(&owned.left), 2);
+    assert_eq!(Rc::strong_count(&owned.right), 2);
+
+    ALLOCATION_COUNT.store(0, Ordering::SeqCst);
+    COUNT_ALLOCATIONS.store(true, Ordering::SeqCst);
+    drop(owned);
+    COUNT_ALLOCATIONS.store(false, Ordering::SeqCst);
+
+    assert_eq!(
+        ALLOCATION_COUNT.load(Ordering::SeqCst),
+        0,
+        "dropping distinct shared children must not allocate a teardown worklist"
+    );
 }
 
 #[test]

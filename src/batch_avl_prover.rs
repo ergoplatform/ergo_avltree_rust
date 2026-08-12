@@ -94,6 +94,13 @@ impl BatchAVLProver {
         self.base.changed_nodes_buffer.clear();
         self.base.changed_nodes_buffer_to_check.clear();
 
+        // Drop the abandoned cycle's proof-generation state too. Only
+        // generate_proof() clears this, and a cycle that is rewound never
+        // reaches it — so without this the next pack_tree() expands nodes it
+        // should have labelled, producing a proof that differs from the one an
+        // uncontaminated prover builds for the same tree.
+        self.base.modified_nodes.clear();
+
         // Rebase the proof baseline to the freshly-restored root.
         self.old_top_node = self.base.tree.root.clone();
 

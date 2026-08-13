@@ -167,9 +167,10 @@ impl BatchAVLProver {
         &self,
         operations: &Vec<Operation>,
     ) -> Result<(SerializedAdProof, ADDigest)> {
-        // Clone the tree and reset visited/is_new flags so the cloned
-        // prover's on_node_visit gates correctly on fresh flags.
-        let tree_clone = self.base.tree.clone();
+        // Clone the node graph and reset the preview's visited/is_new flags so
+        // the cloned prover's on_node_visit gates correctly on fresh flags
+        // without mutating the caller's in-flight persistence cycle.
+        let tree_clone = self.base.tree.clone_with_independent_nodes();
         tree_clone.reset();
         let mut new_prover = BatchAVLProver::new(tree_clone, false);
         for op in operations.iter() {

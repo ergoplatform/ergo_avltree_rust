@@ -363,6 +363,33 @@ impl AVLTree {
         }
     }
 
+    /// Clone the tree structure into distinct `Rc<RefCell<_>>` nodes while
+    /// retaining the resolver. Preview provers must not share mutable node
+    /// flags with the persistence cycle they preview.
+    pub(crate) fn clone_with_independent_nodes(&self) -> AVLTree {
+        AVLTree {
+            root: self.root.as_ref().map(Self::clone_node),
+            height: self.height,
+            key_length: self.key_length,
+            value_length: self.value_length,
+            resolver: self.resolver.clone(),
+        }
+    }
+
+    fn clone_node(node: &NodeId) -> NodeId {
+        let cloned = match &*node.borrow() {
+            Node::LabelOnly(header) => Node::LabelOnly(header.clone()),
+            Node::Leaf(leaf) => Node::Leaf(leaf.clone()),
+            Node::Internal(internal) => Node::Internal(InternalNode {
+                hdr: internal.hdr.clone(),
+                balance: internal.balance,
+                left: Self::clone_node(&internal.left),
+                right: Self::clone_node(&internal.right),
+            }),
+        };
+        Rc::new(RefCell::new(cloned))
+    }
+
     pub fn left(&self, node: &NodeId) -> NodeId {
         if let Node::Internal(r) = &mut *node.borrow_mut() {
             self.resolve(&mut r.left)

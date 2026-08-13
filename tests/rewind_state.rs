@@ -12,9 +12,13 @@
 mod common;
 use common::*;
 
+use bytes::Bytes;
+use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
+use ergo_avltree_rust::batch_node::{Node, NodeId};
 use ergo_avltree_rust::operation::*;
 use ergo_avltree_rust::persistent_batch_avl_prover::*;
+use std::rc::Rc;
 
 /// Applies `kvs` as inserts and stops there, without closing the proof cycle —
 /// the shape of a block that is applied and then rejected.
@@ -30,6 +34,29 @@ fn apply_without_proof(prover: &mut BatchAVLProver, kvs: &[KeyValue]) {
 /// are driven identically.
 fn kv_batch(offset: usize, size: usize) -> Vec<KeyValue> {
     generate_kv_list(offset + size)[offset..].to_vec()
+}
+
+fn node_flags(node: &NodeId, flags: &mut Vec<(usize, bool, bool)>) {
+    let node_ref = node.borrow();
+    flags.push((
+        Rc::as_ptr(node) as usize,
+        node_ref.visited(),
+        node_ref.is_new(),
+    ));
+    let children = match &*node_ref {
+        Node::Internal(internal) => Some((internal.left.clone(), internal.right.clone())),
+        _ => None,
+    };
+    drop(node_ref);
+
+    if let Some((left, right)) = children {
+        node_flags(&left, flags);
+        node_flags(&right, flags);
+    }
+}
+
+fn node_ids(nodes: &[NodeId]) -> Vec<usize> {
+    nodes.iter().map(|node| Rc::as_ptr(node) as usize).collect()
 }
 
 #[test]
@@ -137,4 +164,50 @@ fn proof_after_rejected_cycle_matches_uncontaminated_prover() {
         proof_a.len(),
         proof_b.len()
     );
+}
+
+#[test]
+fn preview_keeps_an_in_flight_persistence_cycle_unchanged() {
+    let mut prover = generate_prover(KEY_LENGTH, Some(8));
+    let applied = KeyValue {
+        key: Bytes::from(vec![0x11; KEY_LENGTH]),
+        value: Bytes::from(vec![0xAA; 8]),
+    };
+    let preview = Operation::Insert(KeyValue {
+        key: Bytes::from(vec![0x22; KEY_LENGTH]),
+        value: Bytes::from(vec![0xBB; 8]),
+    });
+    prover
+        .perform_one_operation(&Operation::Insert(applied.clone()))
+        .unwrap();
+
+    let root_before = prover.top_node();
+    let digest_before = prover.digest().unwrap();
+    let mut flags_before = Vec::new();
+    node_flags(&root_before, &mut flags_before);
+    let changed_before = node_ids(&prover.base.changed_nodes_buffer);
+    let changed_to_check_before = node_ids(&prover.base.changed_nodes_buffer_to_check);
+    let modified_before: Vec<usize> = prover.base.modified_nodes.keys().copied().collect();
+
+    prover
+        .generate_proof_for_operations(&vec![preview.clone()])
+        .unwrap();
+
+    let root_after = prover.top_node();
+    let mut flags_after = Vec::new();
+    node_flags(&root_after, &mut flags_after);
+    assert!(Rc::ptr_eq(&root_before, &root_after));
+    assert_eq!(prover.digest().unwrap(), digest_before);
+    assert_eq!(flags_after, flags_before);
+    assert_eq!(node_ids(&prover.base.changed_nodes_buffer), changed_before);
+    assert_eq!(
+        node_ids(&prover.base.changed_nodes_buffer_to_check),
+        changed_to_check_before
+    );
+    assert_eq!(
+        prover.base.modified_nodes.keys().copied().collect::<Vec<_>>(),
+        modified_before
+    );
+    assert_eq!(prover.unauthenticated_lookup(&applied.key), Some(applied.value));
+    assert!(prover.unauthenticated_lookup(&preview.key()).is_none());
 }

@@ -114,6 +114,16 @@ Here are code examples for generating proofs and checking them. In this example 
   }
 ```
 
+## Compatibility notes
+
+- `Resolver` is now an `Arc<dyn Fn(&Digest32) -> Node + Send + Sync>`. Bare
+  closures and function pointers continue to use `AVLTree::new`; pre-built
+  `Resolver` values must use `AVLTree::with_resolver`.
+- `AuthenticatedTreeOpsBase` gained proof-cycle bookkeeping. Downstream struct
+  literals must use its constructor instead of naming every field directly.
+- `contains` now treats unresolved `LabelOnly` nodes conservatively as “maybe
+  present”, preventing unsafe deletion of persistent nodes.
+
 ## Persistent Storage (Versioned Database)
 
 This crate provides an optional `redb`-backed persistent storage layer implementing the `VersionedAVLStorage` trait. It features an **undo-log architecture** for fast rollbacks and history navigation, mirroring the Scala `LDBVersionedStore`.
@@ -129,7 +139,7 @@ ergo_avltree_rust = { version = "0.1", features = ["persistence"] }
 
 - **`RedbVersionedStore`** — Low-level versioned key-value store with 4 strictly-typed `redb` tables (`nodes`, `meta`, `undo_log`, `versions`). Each `update()` atomically records compensating undo entries; `rollback()` walks the version chain and applies them in reverse.
 - **`RedbAVLStorage`** — Implements `VersionedAVLStorage`. Bridges the AVL tree to the versioned store using the existing `pack()`/`unpack()` serialization. Provides a `Resolver` closure backed by the database for lazy node loading.
-- **Zero write amplification** — Nodes are content-addressed by their Blake2b hash. Unchanged nodes skip DB writes entirely.
+- **Content-addressed node deduplication** — Unchanged nodes skip content writes; metadata and undo-log entries still record each persisted transition.
 - **Pure Rust** — No C/C++ dependencies (unlike RocksDB/LevelDB). Simplifies cross-compilation and future WASM integration.
 
 ### Example

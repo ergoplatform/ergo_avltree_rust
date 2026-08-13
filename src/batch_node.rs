@@ -364,20 +364,32 @@ impl AVLTree {
     }
 
     /// Clone the tree structure into distinct `Rc<RefCell<_>>` nodes while
-    /// retaining the resolver. Preview provers must not share mutable node
-    /// flags with the persistence cycle they preview.
+    /// wrapping the resolver to detach every lazy-loaded graph too. Preview
+    /// provers must not share mutable node flags with the persistence cycle
+    /// they preview or with resolver-owned node caches.
     pub(crate) fn clone_with_independent_nodes(&self) -> AVLTree {
+        let resolver = self.resolver.clone();
+        let preview_resolver: Resolver = alloc::sync::Arc::new(move |digest| {
+            let resolved = resolver(digest);
+            let detached = AVLTree::clone_node_value(&resolved);
+            let preview_node = detached.borrow().clone();
+            preview_node
+        });
         AVLTree {
             root: self.root.as_ref().map(Self::clone_node),
             height: self.height,
             key_length: self.key_length,
             value_length: self.value_length,
-            resolver: self.resolver.clone(),
+            resolver: preview_resolver,
         }
     }
 
     fn clone_node(node: &NodeId) -> NodeId {
-        let cloned = match &*node.borrow() {
+        Self::clone_node_value(&node.borrow())
+    }
+
+    fn clone_node_value(node: &Node) -> NodeId {
+        let cloned = match node {
             Node::LabelOnly(header) => Node::LabelOnly(header.clone()),
             Node::Leaf(leaf) => Node::Leaf(leaf.clone()),
             Node::Internal(internal) => Node::Internal(InternalNode {

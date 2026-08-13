@@ -15,10 +15,15 @@ use common::*;
 use bytes::Bytes;
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
-use ergo_avltree_rust::batch_node::{Node, NodeId};
+use ergo_avltree_rust::batch_node::{AVLTree, InternalNode, LeafNode, Node, NodeId};
 use ergo_avltree_rust::operation::*;
 use ergo_avltree_rust::persistent_batch_avl_prover::*;
+use std::cell::RefCell;
 use std::rc::Rc;
+
+thread_local! {
+    static LAZY_RESOLVER_CACHE: RefCell<Option<Node>> = RefCell::new(None);
+}
 
 /// Applies `kvs` as inserts and stops there, without closing the proof cycle —
 /// the shape of a block that is applied and then rejected.
@@ -57,6 +62,23 @@ fn node_flags(node: &NodeId, flags: &mut Vec<(usize, bool, bool)>) {
 
 fn node_ids(nodes: &[NodeId]) -> Vec<usize> {
     nodes.iter().map(|node| Rc::as_ptr(node) as usize).collect()
+}
+
+fn lazy_resolver(_digest: &Digest32) -> Node {
+    LAZY_RESOLVER_CACHE.with(|cache| cache.borrow().as_ref().unwrap().clone())
+}
+
+fn lazy_cache_snapshot() -> (bool, Vec<(usize, bool, bool)>) {
+    LAZY_RESOLVER_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        let node = cache.as_ref().unwrap();
+        let mut flags = Vec::new();
+        if let Node::Internal(internal) = node {
+            node_flags(&internal.left, &mut flags);
+            node_flags(&internal.right, &mut flags);
+        }
+        (node.is_internal(), flags)
+    })
 }
 
 #[test]
@@ -210,4 +232,43 @@ fn preview_keeps_an_in_flight_persistence_cycle_unchanged() {
     );
     assert_eq!(prover.unauthenticated_lookup(&applied.key), Some(applied.value));
     assert!(prover.unauthenticated_lookup(&preview.key()).is_none());
+
+    let mut proof_prover = generate_prover(KEY_LENGTH, Some(8));
+    let (preview_proof, preview_digest) = proof_prover
+        .generate_proof_for_operations(&vec![preview.clone()])
+        .unwrap();
+    proof_prover.perform_one_operation(&preview).unwrap();
+    assert_eq!(proof_prover.generate_proof(), preview_proof);
+    assert_eq!(proof_prover.digest().unwrap(), preview_digest);
+}
+
+#[test]
+fn preview_does_not_mutate_lazy_resolver_cache_children() {
+    let min = Bytes::from(vec![0x00; KEY_LENGTH]);
+    let split = Bytes::from(vec![0x40; KEY_LENGTH]);
+    let root_key = Bytes::from(vec![0x80; KEY_LENGTH]);
+    let max = Bytes::from(vec![0xFF; KEY_LENGTH]);
+    let value = Bytes::from(vec![0x00; 8]);
+    let lazy_left = LeafNode::new(&min, &value, &split);
+    let lazy_right = LeafNode::new(&split, &value, &root_key);
+    let lazy_internal = InternalNode::new(Some(split.clone()), &lazy_left, &lazy_right, 0);
+    LAZY_RESOLVER_CACHE.with(|cache| cache.replace(Some(lazy_internal.borrow().clone())));
+
+    let lazy_label = Node::new_label(&[0xA5; 32]);
+    let right = LeafNode::new(&root_key, &value, &max);
+    let root = InternalNode::new(Some(root_key.clone()), &lazy_label, &right, -1);
+    let mut tree = AVLTree::new(lazy_resolver, KEY_LENGTH, Some(8));
+    tree.root = Some(root);
+    tree.height = 2;
+    let prover = BatchAVLProver::new(tree, true);
+    prover.base.tree.reset();
+
+    let cache_before = lazy_cache_snapshot();
+    let operation = Operation::Insert(KeyValue {
+        key: Bytes::from(vec![0x10; KEY_LENGTH]),
+        value: Bytes::from(vec![0xCC; 8]),
+    });
+    prover.generate_proof_for_operations(&vec![operation]).unwrap();
+
+    assert_eq!(lazy_cache_snapshot(), cache_before);
 }

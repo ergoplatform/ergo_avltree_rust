@@ -653,4 +653,24 @@ mod tests {
         }));
         assert!(legacy.is_err(), "legacy query must fail-stop on corruption");
     }
+
+    #[test]
+    fn fallible_version_and_history_queries_reject_partial_metadata() {
+        let dir = tempdir().unwrap();
+        let storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        storage
+            .store
+            .set_metadata_for_test(Some(b"v1"), None)
+            .unwrap();
+        assert!(storage.try_version().is_err());
+        assert!(storage.try_rollback_versions().is_err());
+
+        let next = 0u64.to_le_bytes();
+        storage
+            .store
+            .set_metadata_for_test(None, Some(&next))
+            .unwrap();
+        assert!(storage.try_version().is_err());
+        assert!(storage.try_rollback_versions().is_err());
+    }
 }

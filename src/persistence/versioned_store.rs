@@ -13,7 +13,7 @@
 
 use alloc::{collections::BTreeSet, vec::Vec};
 use anyhow::{anyhow, Result};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::Path;
 
 /// Main data table: node hash (32 bytes) → serialized node
@@ -185,6 +185,51 @@ impl VersionRecord {
     }
 }
 
+fn validate_metadata_state(
+    last_version: Option<Vec<u8>>,
+    next_lsn_bytes: Option<Vec<u8>>,
+    tip_record_bytes: Option<Vec<u8>>,
+    versions_empty: bool,
+    undo_empty: bool,
+) -> Result<Option<(Vec<u8>, u64)>> {
+    match (last_version, next_lsn_bytes) {
+        (None, None) => {
+            if !versions_empty {
+                return Err(anyhow!("Redb metadata is empty but version records remain"));
+            }
+            if !undo_empty {
+                return Err(anyhow!(
+                    "Redb metadata is empty but undo-log entries remain"
+                ));
+            }
+            Ok(None)
+        }
+        (Some(_), None) => Err(anyhow!("Redb metadata has a version without next LSN")),
+        (None, Some(_)) => Err(anyhow!("Redb metadata has a next LSN without version")),
+        (Some(tip), Some(next_lsn_bytes)) => {
+            let encoded_next_lsn: [u8; 8] = next_lsn_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("Persisted next LSN must be exactly 8 bytes"))?;
+            let next_lsn = u64::from_le_bytes(encoded_next_lsn);
+            let record_bytes =
+                tip_record_bytes.ok_or_else(|| anyhow!("Redb tip version record is missing"))?;
+            let record = VersionRecord::deserialize(&record_bytes)?;
+            if record.version_id != tip {
+                return Err(anyhow!("Version record ID does not match lookup key"));
+            }
+            let expected_next_lsn = record
+                .end_lsn
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("Undo-log LSN overflow"))?;
+            if expected_next_lsn != next_lsn {
+                return Err(anyhow!("Redb tip record end LSN does not match next LSN"));
+            }
+            Ok(Some((tip, next_lsn)))
+        }
+    }
+}
+
 /// A versioned key-value store backed by `redb` with undo-log rollback.
 ///
 /// This mirrors Scala's `LDBVersionedStore`:
@@ -215,11 +260,25 @@ impl RedbVersionedStore {
     /// Get the last version ID, or None if store is empty.
     pub fn last_version_id(&self) -> Result<Option<Vec<u8>>> {
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(META_TABLE)?;
-        match table.get(META_LAST_VERSION)? {
-            Some(v) => Ok(Some(v.value().to_vec())),
-            None => Ok(None),
-        }
+        let meta = txn.open_table(META_TABLE)?;
+        let versions = txn.open_table(VERSIONS_TABLE)?;
+        let undo_log = txn.open_table(UNDO_LOG_TABLE)?;
+        let last_version = meta
+            .get(META_LAST_VERSION)?
+            .map(|value| value.value().to_vec());
+        let next_lsn = meta.get(META_NEXT_LSN)?.map(|value| value.value().to_vec());
+        let tip_record = match last_version.as_deref() {
+            Some(tip) => versions.get(tip)?.map(|value| value.value().to_vec()),
+            None => None,
+        };
+        Ok(validate_metadata_state(
+            last_version,
+            next_lsn,
+            tip_record,
+            versions.is_empty()?,
+            undo_log.is_empty()?,
+        )?
+        .map(|(tip, _)| tip))
     }
 
     /// Read a node by its hash key.
@@ -254,6 +313,36 @@ impl RedbVersionedStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_metadata_for_test(
+        &self,
+        last_version: Option<&[u8]>,
+        next_lsn: Option<&[u8]>,
+    ) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut meta = txn.open_table(META_TABLE)?;
+            match last_version {
+                Some(value) => {
+                    meta.insert(META_LAST_VERSION, value)?;
+                }
+                None => {
+                    meta.remove(META_LAST_VERSION)?;
+                }
+            }
+            match next_lsn {
+                Some(value) => {
+                    meta.insert(META_NEXT_LSN, value)?;
+                }
+                None => {
+                    meta.remove(META_NEXT_LSN)?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Verify that a repeated AVL digest describes the exact current state.
     ///
     /// The low-level update API always rejects reused version IDs. The AVL
@@ -269,19 +358,25 @@ impl RedbVersionedStore {
         let nodes = txn.open_table(NODES_TABLE)?;
         let meta = txn.open_table(META_TABLE)?;
         let versions = txn.open_table(VERSIONS_TABLE)?;
+        let undo_log = txn.open_table(UNDO_LOG_TABLE)?;
 
-        let current = meta
+        let last_version = meta
             .get(META_LAST_VERSION)?
             .map(|value| value.value().to_vec());
-        if current.as_deref() != Some(version_id) {
+        let next_lsn = meta.get(META_NEXT_LSN)?.map(|value| value.value().to_vec());
+        let tip_record = match last_version.as_deref() {
+            Some(tip) => versions.get(tip)?.map(|value| value.value().to_vec()),
+            None => None,
+        };
+        let current = validate_metadata_state(
+            last_version,
+            next_lsn,
+            tip_record,
+            versions.is_empty()?,
+            undo_log.is_empty()?,
+        )?;
+        if current.as_ref().map(|(tip, _)| tip.as_slice()) != Some(version_id) {
             return Err(anyhow!("Version ID is not the current persistence tip"));
-        }
-        let record_bytes = versions
-            .get(version_id)?
-            .ok_or_else(|| anyhow!("Current persistence version record is missing"))?;
-        let record = VersionRecord::deserialize(record_bytes.value())?;
-        if record.version_id != version_id {
-            return Err(anyhow!("Version record ID does not match lookup key"));
         }
 
         for (key, expected_value) in expected_entries {
@@ -331,6 +426,27 @@ impl RedbVersionedStore {
             let mut meta = txn.open_table(META_TABLE)?;
             let mut versions = txn.open_table(VERSIONS_TABLE)?;
 
+            let last_version = meta
+                .get(META_LAST_VERSION)?
+                .map(|value| value.value().to_vec());
+            let next_lsn_bytes = meta.get(META_NEXT_LSN)?.map(|value| value.value().to_vec());
+            let tip_record = match last_version.as_deref() {
+                Some(tip) => versions.get(tip)?.map(|value| value.value().to_vec()),
+                None => None,
+            };
+            let metadata_state = validate_metadata_state(
+                last_version,
+                next_lsn_bytes,
+                tip_record,
+                versions.is_empty()?,
+                undo_log.is_empty()?,
+            )?;
+            let (parent_version, mut next_lsn) = match metadata_state {
+                Some((tip, next_lsn)) => (Some(tip), next_lsn),
+                None => (None, 0),
+            };
+            let start_lsn = next_lsn;
+
             if versions.get(version_id)?.is_some() {
                 return Err(anyhow!("Version ID already exists in history"));
             }
@@ -344,20 +460,6 @@ impl RedbVersionedStore {
                     }
                 }
             }
-
-            // Read next_lsn and parent version INSIDE the write txn (Q4 TOCTOU fix)
-            let mut next_lsn = match meta.get(META_NEXT_LSN)? {
-                Some(value) => {
-                    let bytes: [u8; 8] = value
-                        .value()
-                        .try_into()
-                        .map_err(|_| anyhow!("Persisted next LSN must be exactly 8 bytes"))?;
-                    u64::from_le_bytes(bytes)
-                }
-                None => 0,
-            };
-            let start_lsn = next_lsn;
-            let parent_version = meta.get(META_LAST_VERSION)?.map(|v| v.value().to_vec());
 
             // Record undo entries for removals
             for key in to_remove {
@@ -481,20 +583,22 @@ impl RedbVersionedStore {
             let mut meta = txn.open_table(META_TABLE)?;
             let mut versions = txn.open_table(VERSIONS_TABLE)?;
 
-            let current_version = meta
+            let last_version = meta
                 .get(META_LAST_VERSION)?
-                .map(|value| value.value().to_vec())
-                .ok_or_else(|| anyhow!("Store is empty, cannot rollback"))?;
-            let current_next_lsn = match meta.get(META_NEXT_LSN)? {
-                Some(value) => {
-                    let bytes: [u8; 8] = value
-                        .value()
-                        .try_into()
-                        .map_err(|_| anyhow!("Persisted next LSN must be exactly 8 bytes"))?;
-                    u64::from_le_bytes(bytes)
-                }
-                None => return Err(anyhow!("Persisted next LSN is missing")),
+                .map(|value| value.value().to_vec());
+            let next_lsn = meta.get(META_NEXT_LSN)?.map(|value| value.value().to_vec());
+            let tip_record = match last_version.as_deref() {
+                Some(tip) => versions.get(tip)?.map(|value| value.value().to_vec()),
+                None => None,
             };
+            let (current_version, current_next_lsn) = validate_metadata_state(
+                last_version,
+                next_lsn,
+                tip_record,
+                versions.is_empty()?,
+                undo_log.is_empty()?,
+            )?
+            .ok_or_else(|| anyhow!("Store is empty, cannot rollback"))?;
 
             let target_data = versions
                 .get(target_version)?
@@ -615,9 +719,23 @@ impl RedbVersionedStore {
         let txn = self.db.begin_read()?;
         let versions_table = txn.open_table(VERSIONS_TABLE)?;
         let meta = txn.open_table(META_TABLE)?;
-        let mut cursor = meta
+        let undo_log = txn.open_table(UNDO_LOG_TABLE)?;
+        let last_version = meta
             .get(META_LAST_VERSION)?
             .map(|value| value.value().to_vec());
+        let next_lsn = meta.get(META_NEXT_LSN)?.map(|value| value.value().to_vec());
+        let tip_record = match last_version.as_deref() {
+            Some(tip) => versions_table.get(tip)?.map(|value| value.value().to_vec()),
+            None => None,
+        };
+        let mut cursor = validate_metadata_state(
+            last_version,
+            next_lsn,
+            tip_record,
+            versions_table.is_empty()?,
+            undo_log.is_empty()?,
+        )?
+        .map(|(tip, _)| tip);
         let mut visited = BTreeSet::new();
 
         while let Some(vid) = cursor {
@@ -748,7 +866,8 @@ mod tests {
         }));
         assert!(outcome.is_ok(), "malformed next_lsn must not panic");
         assert!(outcome.unwrap().is_err(), "malformed next_lsn must fail");
-        assert_eq!(store.last_version_id().unwrap(), None);
+        assert!(store.last_version_id().is_err());
+        assert_eq!(raw_metadata(&store), (None, Some(vec![0u8; 7])));
         assert_eq!(store.get_node(b"key").unwrap(), None);
     }
 
@@ -796,6 +915,173 @@ mod tests {
             versions.remove(version_id).unwrap();
         }
         txn.commit().unwrap();
+    }
+
+    fn has_version_record(store: &RedbVersionedStore, version_id: &[u8]) -> bool {
+        let txn = store.db.begin_read().unwrap();
+        let versions = txn.open_table(VERSIONS_TABLE).unwrap();
+        versions.get(version_id).unwrap().is_some()
+    }
+
+    fn raw_metadata(store: &RedbVersionedStore) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let txn = store.db.begin_read().unwrap();
+        let meta = txn.open_table(META_TABLE).unwrap();
+        let last = meta
+            .get(META_LAST_VERSION)
+            .unwrap()
+            .map(|value| value.value().to_vec());
+        let next = meta
+            .get(META_NEXT_LSN)
+            .unwrap()
+            .map(|value| value.value().to_vec());
+        (last, next)
+    }
+
+    fn insert_orphan_version(store: &RedbVersionedStore, version_id: &[u8]) {
+        let record = VersionRecord {
+            version_id: version_id.to_vec(),
+            parent_version_id: None,
+            start_lsn: 0,
+            end_lsn: 0,
+        };
+        replace_version_record(store, version_id, &record);
+    }
+
+    fn insert_orphan_undo(store: &RedbVersionedStore, lsn: u64) {
+        let entry = UndoEntry {
+            key: b"orphan".to_vec(),
+            old_value: None,
+        }
+        .serialize()
+        .unwrap();
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut undo = txn.open_table(UNDO_LOG_TABLE).unwrap();
+            undo.insert(lsn, entry.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    fn has_undo_entry(store: &RedbVersionedStore, lsn: u64) -> bool {
+        let txn = store.db.begin_read().unwrap();
+        let undo = txn.open_table(UNDO_LOG_TABLE).unwrap();
+        undo.get(lsn).unwrap().is_some()
+    }
+
+    #[test]
+    fn empty_metadata_rejects_orphan_version_records_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        insert_orphan_version(&store, b"orphan");
+
+        let error = store.update(b"v1", &[(b"key", b"value")], &[]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Redb metadata is empty but version records remain"
+        );
+        assert_eq!(store.get_node(b"key").unwrap(), None);
+        assert!(!has_version_record(&store, b"v1"));
+        assert!(has_version_record(&store, b"orphan"));
+        assert_eq!(raw_metadata(&store), (None, None));
+        assert!(store.last_version_id().is_err());
+        assert!(store.rollback_versions().is_err());
+    }
+
+    #[test]
+    fn empty_metadata_rejects_orphan_undo_entries_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        insert_orphan_undo(&store, 0);
+
+        let error = store.update(b"v1", &[(b"key", b"value")], &[]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Redb metadata is empty but undo-log entries remain"
+        );
+        assert_eq!(store.get_node(b"key").unwrap(), None);
+        assert!(!has_version_record(&store, b"v1"));
+        assert!(has_undo_entry(&store, 0));
+        assert_eq!(raw_metadata(&store), (None, None));
+        assert!(store.last_version_id().is_err());
+        assert!(store.rollback_versions().is_err());
+    }
+
+    #[test]
+    fn update_rejects_last_version_without_next_lsn_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.set_metadata_for_test(Some(b"v0"), None).unwrap();
+
+        let error = store.update(b"v1", &[(b"key", b"value")], &[]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Redb metadata has a version without next LSN"
+        );
+        assert_eq!(store.get_node(b"key").unwrap(), None);
+        assert!(!has_version_record(&store, b"v1"));
+        assert_eq!(raw_metadata(&store), (Some(b"v0".to_vec()), None));
+    }
+
+    #[test]
+    fn update_rejects_next_lsn_without_last_version_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        let next = 0u64.to_le_bytes();
+        store.set_metadata_for_test(None, Some(&next)).unwrap();
+
+        let error = store.update(b"v1", &[(b"key", b"value")], &[]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Redb metadata has a next LSN without version"
+        );
+        assert_eq!(store.get_node(b"key").unwrap(), None);
+        assert!(!has_version_record(&store, b"v1"));
+        assert_eq!(raw_metadata(&store), (None, Some(next.to_vec())));
+    }
+
+    #[test]
+    fn update_rejects_tip_record_whose_end_does_not_match_next_lsn() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v1", &[(b"key", b"one")], &[]).unwrap();
+        let mut record = version_record(&store, b"v1");
+        record.end_lsn = record.end_lsn.checked_add(1).unwrap();
+        replace_version_record(&store, b"v1", &record);
+        let metadata_before = raw_metadata(&store);
+
+        let error = store.update(b"v2", &[(b"key", b"two")], &[]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Redb tip record end LSN does not match next LSN"
+        );
+        assert_eq!(store.get_node(b"key").unwrap(), Some(b"one".to_vec()));
+        assert!(!has_version_record(&store, b"v2"));
+        assert_eq!(raw_metadata(&store), metadata_before);
+    }
+
+    #[test]
+    fn verify_current_state_rejects_broken_next_lsn_lineage() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v1", &[(b"key", b"one")], &[]).unwrap();
+        let wrong_next = 2u64.to_le_bytes();
+        store
+            .set_metadata_for_test(Some(b"v1"), Some(&wrong_next))
+            .unwrap();
+
+        let error = store
+            .verify_current_state(b"v1", &[(b"key", b"one")], &[])
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Redb tip record end LSN does not match next LSN"
+        );
     }
 
     #[test]
@@ -1040,13 +1326,15 @@ mod tests {
         let mut record = version_record(&store, b"v1");
         record.version_id = b"wrong".to_vec();
         replace_version_record(&store, b"v1", &record);
+        let metadata_before = raw_metadata(&store);
 
         let error = store.rollback(b"v0").unwrap_err();
         assert_eq!(
             error.to_string(),
             "Version record ID does not match lookup key"
         );
-        assert_eq!(store.last_version_id().unwrap(), Some(b"v1".to_vec()));
+        assert!(store.last_version_id().is_err());
+        assert_eq!(raw_metadata(&store), metadata_before);
         assert_eq!(store.get_node(b"key").unwrap(), Some(b"one".to_vec()));
     }
 

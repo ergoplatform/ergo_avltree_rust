@@ -129,10 +129,19 @@ impl RedbAVLStorage {
         expected_digest: &Digest32,
         depth: usize,
         active_path: &mut BTreeSet<Digest32>,
+        seen: &mut BTreeSet<Digest32>,
     ) -> Result<(NodeId, ValidatedSubtree)> {
         ensure!(
             depth <= u8::MAX as usize,
             "Persisted AVL depth exceeds digest encoding"
+        );
+        ensure!(
+            !active_path.contains(expected_digest),
+            "Cycle detected in reachable AVL nodes"
+        );
+        ensure!(
+            seen.insert(*expected_digest),
+            "Persisted AVL digest is reachable more than once"
         );
         ensure!(
             active_path.insert(*expected_digest),
@@ -182,6 +191,7 @@ impl RedbAVLStorage {
                             .checked_add(1)
                             .ok_or_else(|| anyhow!("Persisted AVL depth overflow"))?,
                         active_path,
+                        seen,
                     )?;
                     let (_, right) = Self::validate_reachable_node(
                         lookup,
@@ -191,6 +201,7 @@ impl RedbAVLStorage {
                             .checked_add(1)
                             .ok_or_else(|| anyhow!("Persisted AVL depth overflow"))?,
                         active_path,
+                        seen,
                     )?;
 
                     ensure!(
@@ -289,8 +300,16 @@ impl RedbAVLStorage {
         );
 
         let tree = AVLTree::with_resolver(validation_resolver, key_length, value_length);
-        let (root, summary) =
-            Self::validate_reachable_node(lookup, &tree, &root_digest, 0, &mut BTreeSet::new())?;
+        let mut active_path = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        let (root, summary) = Self::validate_reachable_node(
+            lookup,
+            &tree,
+            &root_digest,
+            0,
+            &mut active_path,
+            &mut seen,
+        )?;
         ensure!(
             summary.min_key == tree.negative_infinity_key(),
             "Persisted AVL tree is missing its negative-infinity sentinel"
@@ -605,6 +624,50 @@ mod tests {
         assert_eq!(
             storage.store.get_node(TOP_NODE_HEIGHT_KEY).unwrap(),
             height_before
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_a_shared_reachable_digest_before_a_second_lookup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempdir().unwrap();
+        let mut storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        let shared = LeafNode::new(&repeated_key(0), &Bytes::new(), &repeated_key(0xFF));
+        let shared_digest = shared.borrow_mut().label();
+        let root = InternalNode::new(Some(repeated_key(0)), &shared, &shared, 0);
+        let target = persist_root(&mut storage, root, 1);
+        let shared_lookups = AtomicUsize::new(0);
+
+        let error = storage
+            .store
+            .rollback_with_validation(&target, |lookup| {
+                let counted_lookup = |key: &[u8]| {
+                    if key == shared_digest.as_slice() {
+                        shared_lookups.fetch_add(1, Ordering::SeqCst);
+                    }
+                    lookup(key)
+                };
+                RedbAVLStorage::validate_and_load_snapshot(
+                    &counted_lookup,
+                    &target,
+                    32,
+                    None,
+                    Arc::new(|digest| Node::LabelOnly(NodeHeader::new(Some(*digest), None))),
+                )
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            shared_lookups.load(Ordering::SeqCst),
+            1,
+            "a shared digest must be rejected before a second database lookup"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Persisted AVL digest is reachable more than once"),
+            "unexpected rollback error: {error:#}"
         );
     }
 

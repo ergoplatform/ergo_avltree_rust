@@ -21,6 +21,8 @@ use std::path::Path;
 const TOP_NODE_HASH_KEY: &[u8] = b"__top_node_hash__";
 const TOP_NODE_HEIGHT_KEY: &[u8] = b"__top_node_height__";
 
+type SnapshotLookup<'a> = dyn Fn(&[u8]) -> Result<Option<Vec<u8>>> + 'a;
+
 struct ValidatedSubtree {
     min_key: ADKey,
     max_key: ADKey,
@@ -124,7 +126,7 @@ impl RedbAVLStorage {
     }
 
     fn validate_reachable_node(
-        lookup: &dyn Fn(&[u8]) -> Result<Option<Vec<u8>>>,
+        lookup: &SnapshotLookup<'_>,
         tree: &AVLTree,
         expected_digest: &Digest32,
         depth: usize,
@@ -264,7 +266,7 @@ impl RedbAVLStorage {
     }
 
     fn validate_and_load_snapshot(
-        lookup: &dyn Fn(&[u8]) -> Result<Option<Vec<u8>>>,
+        lookup: &SnapshotLookup<'_>,
         version: &[u8],
         key_length: usize,
         value_length: Option<usize>,

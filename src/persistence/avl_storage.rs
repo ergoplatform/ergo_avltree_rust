@@ -12,7 +12,7 @@ use crate::versioned_avl_storage::VersionedAVLStorage;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, ensure, Result};
 use bytes::Bytes;
 use std::path::Path;
 
@@ -32,12 +32,30 @@ pub struct RedbAVLStorage {
 }
 
 impl RedbAVLStorage {
+    fn cached_label(node: &Node) -> Option<Digest32> {
+        match node {
+            Node::LabelOnly(header) => header.label,
+            Node::Internal(internal) => internal.hdr.label,
+            Node::Leaf(leaf) => leaf.hdr.label,
+        }
+    }
+
+    fn unpack_verified_node(
+        tree: &AVLTree,
+        bytes: &Bytes,
+        expected_digest: &Digest32,
+    ) -> Result<NodeId> {
+        let node = tree.unpack(bytes);
+        let actual_digest = node.borrow_mut().label();
+        ensure!(
+            actual_digest == *expected_digest,
+            "Persisted node digest does not match its content-address key"
+        );
+        Ok(node)
+    }
+
     /// Create a new persistent AVL storage at the given path.
-    pub fn open(
-        path: &Path,
-        key_length: usize,
-        value_length: Option<usize>,
-    ) -> Result<Self> {
+    pub fn open(path: &Path, key_length: usize, value_length: Option<usize>) -> Result<Self> {
         let store = RedbVersionedStore::open(path)?;
         Ok(RedbAVLStorage {
             store: Arc::new(store),
@@ -60,11 +78,12 @@ impl RedbAVLStorage {
                 Ok(Some(data)) => {
                     let bytes = Bytes::from(data);
                     // Temporary AVLTree for deserialization only
-                    let dummy_resolver: Resolver = Arc::new(|d: &Digest32| {
-                        Node::LabelOnly(NodeHeader::new(Some(*d), None))
-                    });
-                    let dummy_tree = AVLTree::new(dummy_resolver, key_length, value_length);
-                    let node_id = dummy_tree.unpack(&bytes);
+                    let dummy_resolver: Resolver =
+                        Arc::new(|d: &Digest32| Node::LabelOnly(NodeHeader::new(Some(*d), None)));
+                    let dummy_tree =
+                        AVLTree::with_resolver(dummy_resolver, key_length, value_length);
+                    let node_id = Self::unpack_verified_node(&dummy_tree, &bytes, digest)
+                        .expect("Persisted node failed content-address verification");
                     let node = node_id.borrow().clone();
                     node
                 }
@@ -83,11 +102,7 @@ impl RedbAVLStorage {
 
     /// Collect all resolved nodes from the tree by walking it recursively.
     /// Returns (label, packed_bytes) pairs for visited (non-LabelOnly) nodes.
-    fn collect_all_nodes(
-        tree: &AVLTree,
-        node: &NodeId,
-        result: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    ) {
+    fn collect_all_nodes(tree: &AVLTree, node: &NodeId, result: &mut Vec<(Vec<u8>, Vec<u8>)>) {
         let n = node.borrow().clone();
         match &n {
             Node::LabelOnly(_) => {
@@ -150,8 +165,16 @@ impl VersionedAVLStorage for RedbAVLStorage {
         let removed = prover.removed_nodes();
         let removed_labels: Vec<Vec<u8>> = removed
             .iter()
-            .map(|n| n.borrow().get_label().to_vec())
-            .collect();
+            .map(|node| {
+                Self::cached_label(&node.borrow())
+                    .map(|label| label.to_vec())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Removed node has no cached persistence identity; persist the baseline before applying operations"
+                        )
+                    })
+            })
+            .collect::<Result<_>>()?;
         let to_remove: Vec<&[u8]> = removed_labels.iter().map(|l| l.as_slice()).collect();
 
         self.store.update(&new_digest, &to_insert, &to_remove)?;
@@ -177,26 +200,101 @@ impl VersionedAVLStorage for RedbAVLStorage {
             .ok_or_else(|| anyhow!("Root node data not found after rollback"))?;
 
         let root_bytes = Bytes::from(root_data);
-        let tree = AVLTree::new(
-            self.create_resolver(),
-            self.key_length,
-            self.value_length,
-        );
-        let root_node = tree.unpack(&root_bytes);
+        let root_digest: Digest32 = root_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Invalid persisted root hash length"))?;
+        let tree =
+            AVLTree::with_resolver(self.create_resolver(), self.key_length, self.value_length);
+        let root_node = Self::unpack_verified_node(&tree, &root_bytes, &root_digest)?;
 
         Ok((root_node, height))
     }
 
     fn version(&self) -> Option<ADDigest> {
-        self.store
-            .last_version_id()
-            .ok()
-            .flatten()
-            .map(Bytes::from)
+        self.store.last_version_id().ok().flatten().map(Bytes::from)
     }
 
     fn rollback_versions<'a>(&'a self) -> Box<dyn Iterator<Item = ADDigest> + 'a> {
         let versions = self.store.rollback_versions().unwrap_or_default();
         Box::new(versions.into_iter().map(Bytes::from))
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.store.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::ToString;
+    use alloc::vec;
+    use tempfile::tempdir;
+
+    fn dummy_resolver(digest: &Digest32) -> Node {
+        Node::LabelOnly(NodeHeader::new(Some(*digest), None))
+    }
+
+    fn packed_leaf() -> (AVLTree, Bytes, Digest32) {
+        let tree = AVLTree::new(dummy_resolver, 32, None);
+        let key = Bytes::from(vec![1u8; 32]);
+        let value = Bytes::from("value");
+        let next_key = Bytes::from(vec![2u8; 32]);
+        let leaf = LeafNode::new(&key, &value, &next_key);
+        let digest = leaf.borrow_mut().label();
+        let bytes = tree.pack(leaf);
+        (tree, bytes, digest)
+    }
+
+    #[test]
+    fn fresh_unlabelled_node_has_no_persisted_removal_key() {
+        let key = Bytes::from(vec![1u8; 32]);
+        let value = Bytes::from("value");
+        let next_key = Bytes::from(vec![2u8; 32]);
+        let leaf = LeafNode::new(&key, &value, &next_key);
+
+        assert_eq!(RedbAVLStorage::cached_label(&leaf.borrow()), None);
+    }
+
+    #[test]
+    fn raw_mutation_without_a_persisted_baseline_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("avl.redb");
+        let mut storage = RedbAVLStorage::open(&path, 32, None).unwrap();
+        let tree = AVLTree::new(dummy_resolver, 32, None);
+        let mut prover = BatchAVLProver::new(tree, true);
+        let key = Bytes::from(vec![1u8; 32]);
+        let value = Bytes::from("value");
+        prover
+            .perform_one_operation(&Operation::Insert(KeyValue { key, value }))
+            .unwrap();
+
+        let error = storage.update(&mut prover, vec![]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Removed node has no cached persistence identity; persist the baseline before applying operations"
+        );
+        assert_eq!(storage.version(), None);
+    }
+
+    #[test]
+    fn verified_unpack_caches_the_content_address() {
+        let (tree, bytes, digest) = packed_leaf();
+
+        let node = RedbAVLStorage::unpack_verified_node(&tree, &bytes, &digest).unwrap();
+
+        assert_eq!(RedbAVLStorage::cached_label(&node.borrow()), Some(digest));
+    }
+
+    #[test]
+    fn verified_unpack_rejects_a_mismatched_content_address() {
+        let (tree, bytes, mut digest) = packed_leaf();
+        digest[0] ^= 1;
+
+        let result = RedbAVLStorage::unpack_verified_node(&tree, &bytes, &digest);
+
+        assert!(result.is_err());
     }
 }

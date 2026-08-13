@@ -177,8 +177,6 @@ impl RedbVersionedStore {
         Ok(RedbVersionedStore { db })
     }
 
-
-
     /// Get the last version ID, or None if store is empty.
     pub fn last_version_id(&self) -> Result<Option<Vec<u8>>> {
         let txn = self.db.begin_read()?;
@@ -219,15 +217,15 @@ impl RedbVersionedStore {
             let mut versions = txn.open_table(VERSIONS_TABLE)?;
 
             // Read next_lsn and parent version INSIDE the write txn (Q4 TOCTOU fix)
-            let mut next_lsn = meta.get(META_NEXT_LSN)?
+            let mut next_lsn = meta
+                .get(META_NEXT_LSN)?
                 .map(|v| {
                     let bytes: [u8; 8] = v.value().try_into().unwrap();
                     u64::from_le_bytes(bytes)
                 })
                 .unwrap_or(0);
             let start_lsn = next_lsn;
-            let parent_version = meta.get(META_LAST_VERSION)?
-                .map(|v| v.value().to_vec());
+            let parent_version = meta.get(META_LAST_VERSION)?.map(|v| v.value().to_vec());
 
             // Record undo entries for removals
             for key in to_remove {
@@ -324,8 +322,7 @@ impl RedbVersionedStore {
                 // Apply undo entries in reverse LSN order
                 let mut lsn = *end_lsn;
                 loop {
-                    let entry_data = undo_log.get(lsn)?
-                        .map(|guard| guard.value().to_vec());
+                    let entry_data = undo_log.get(lsn)?.map(|guard| guard.value().to_vec());
                     if let Some(data) = entry_data {
                         let entry = UndoEntry::deserialize(&data)?;
                         match entry.old_value {
@@ -353,7 +350,8 @@ impl RedbVersionedStore {
             meta.insert(META_LAST_VERSION, target_version)?;
 
             // Recalculate next_lsn from the target version
-            let target_data = versions.get(target_version)?
+            let target_data = versions
+                .get(target_version)?
                 .map(|guard| guard.value().to_vec());
             if let Some(data) = target_data {
                 let target_record = VersionRecord::deserialize(&data)?;
@@ -431,11 +429,7 @@ mod tests {
 
         // Version 1: insert key_a
         store
-            .update(
-                b"v1",
-                &[(b"key_a".as_slice(), b"val_1".as_slice())],
-                &[],
-            )
+            .update(b"v1", &[(b"key_a".as_slice(), b"val_1".as_slice())], &[])
             .unwrap();
 
         // Version 2: update key_a, insert key_b
@@ -475,9 +469,7 @@ mod tests {
             let ver = [b'v', i + b'0'];
             let key = [b'k', i + b'0'];
             let val = [b'v', b'a', b'l', i + b'0'];
-            store
-                .update(&ver, &[(&key[..], &val[..])], &[])
-                .unwrap();
+            store.update(&ver, &[(&key[..], &val[..])], &[]).unwrap();
         }
 
         // Rollback to v2
@@ -502,9 +494,7 @@ mod tests {
             .unwrap();
 
         // v2: remove key
-        store
-            .update(b"v2", &[], &[b"mykey".as_slice()])
-            .unwrap();
+        store.update(b"v2", &[], &[b"mykey".as_slice()]).unwrap();
         assert_eq!(store.get_node(b"mykey").unwrap(), None);
 
         // Rollback to v1: key should be restored

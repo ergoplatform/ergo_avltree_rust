@@ -135,43 +135,38 @@ ergo_avltree_rust = { version = "0.1", features = ["persistence"] }
 ### Example
 
 ```rust
-use std::sync::Arc;
 use std::path::Path;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::batch_node::*;
 use ergo_avltree_rust::operation::*;
 use ergo_avltree_rust::persistence::RedbAVLStorage;
-use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
+use ergo_avltree_rust::persistent_batch_avl_prover::PersistentBatchAVLProver;
 
-// Open persistent storage (creates DB file if needed)
-let mut storage = RedbAVLStorage::open(
+let storage = RedbAVLStorage::open(
     Path::new("/path/to/avl_state.redb"),
-    32,       // key_length
-    None,     // value_length (None = variable)
+    32,
+    None,
+).unwrap();
+let tree = AVLTree::with_resolver(storage.create_resolver(), 32, None);
+let prover = BatchAVLProver::new(tree, true);
+let mut persistent = PersistentBatchAVLProver::new(
+    prover,
+    Box::new(storage),
+    vec![],
 ).unwrap();
 
-// Create prover with DB-backed resolver
-let resolver = storage.create_resolver();
-let tree = AVLTree::new(resolver, 32, None);
-let mut prover = BatchAVLProver::new(tree, true);
-
-// Perform operations
 let key = bytes::Bytes::from(vec![1u8; 32]);
-let val = bytes::Bytes::from("hello");
-prover.perform_one_operation(&Operation::Insert(KeyValue {
-    key: key.clone(), value: val,
+let value = bytes::Bytes::from("hello");
+persistent.perform_one_operation(&Operation::Insert(KeyValue {
+    key,
+    value,
 })).unwrap();
 
-// IMPORTANT: Persist state BEFORE generating the proof!
-// generate_proof() clears internal buffers including removed_nodes.
-storage.update(&mut prover, vec![]).unwrap();
-let proof = prover.generate_proof();
-
-// Rollback to a previous version if needed
-// let (root, height) = storage.rollback(&previous_digest).unwrap();
+let proof = persistent.generate_proof_and_update_storage(vec![]).unwrap();
+persistent.storage.flush().unwrap();
 ```
 
-> **⚠️ Critical ordering rule:** Always call `storage.update()` **before** `prover.generate_proof()`. The proof generation consumes and clears the internal mutation buffers. If you generate the proof first, the storage will not be able to track removed nodes, leading to orphaned data in the database.
+> **⚠️ Critical ordering rule:** Raw `RedbAVLStorage` users must call `update()` before `generate_proof()` because proof generation clears the changed-node buffers; `PersistentBatchAVLProver::generate_proof_and_update_storage` enforces that order.
 
 ### Future Work
 

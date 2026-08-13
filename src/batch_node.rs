@@ -1,4 +1,5 @@
 use crate::operation::*;
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 use blake2::digest::Digest;
@@ -367,36 +368,63 @@ impl AVLTree {
     /// wrapping the resolver to detach every lazy-loaded graph too. Preview
     /// provers must not share mutable node flags with the persistence cycle
     /// they preview or with resolver-owned node caches.
-    pub(crate) fn clone_with_independent_nodes(&self) -> AVLTree {
+    pub(crate) fn clone_with_independent_nodes(
+        &self,
+        old_root: &Option<NodeId>,
+        modified_nodes: &[NodeId],
+    ) -> (AVLTree, Option<NodeId>, BTreeMap<usize, NodeId>) {
         let resolver = self.resolver.clone();
         let preview_resolver: Resolver = alloc::sync::Arc::new(move |digest| {
             let resolved = resolver(digest);
-            let detached = AVLTree::clone_node_value(&resolved);
+            let mut nodes = BTreeMap::new();
+            let detached = AVLTree::clone_node_value(&resolved, &mut nodes);
             let preview_node = detached.borrow().clone();
             preview_node
         });
-        AVLTree {
-            root: self.root.as_ref().map(Self::clone_node),
-            height: self.height,
-            key_length: self.key_length,
-            value_length: self.value_length,
-            resolver: preview_resolver,
+        let mut nodes = BTreeMap::new();
+        let root = self
+            .root
+            .as_ref()
+            .map(|node| Self::clone_node(node, &mut nodes));
+        let old_root = old_root
+            .as_ref()
+            .map(|node| Self::clone_node(node, &mut nodes));
+        for node in modified_nodes {
+            Self::clone_node(node, &mut nodes);
         }
+        (
+            AVLTree {
+                root,
+                height: self.height,
+                key_length: self.key_length,
+                value_length: self.value_length,
+                resolver: preview_resolver,
+            },
+            old_root,
+            nodes,
+        )
     }
 
-    fn clone_node(node: &NodeId) -> NodeId {
-        Self::clone_node_value(&node.borrow())
+    fn clone_node(node: &NodeId, nodes: &mut BTreeMap<usize, NodeId>) -> NodeId {
+        let address = Rc::as_ptr(node) as usize;
+        if let Some(cloned) = nodes.get(&address) {
+            return cloned.clone();
+        }
+        let node_value = node.borrow().clone();
+        let cloned = Self::clone_node_value(&node_value, nodes);
+        nodes.insert(address, cloned.clone());
+        cloned
     }
 
-    fn clone_node_value(node: &Node) -> NodeId {
+    fn clone_node_value(node: &Node, nodes: &mut BTreeMap<usize, NodeId>) -> NodeId {
         let cloned = match node {
             Node::LabelOnly(header) => Node::LabelOnly(header.clone()),
             Node::Leaf(leaf) => Node::Leaf(leaf.clone()),
             Node::Internal(internal) => Node::Internal(InternalNode {
                 hdr: internal.hdr.clone(),
                 balance: internal.balance,
-                left: Self::clone_node(&internal.left),
-                right: Self::clone_node(&internal.right),
+                left: Self::clone_node(&internal.left, nodes),
+                right: Self::clone_node(&internal.right, nodes),
             }),
         };
         Rc::new(RefCell::new(cloned))

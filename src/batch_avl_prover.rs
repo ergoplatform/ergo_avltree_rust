@@ -1,6 +1,7 @@
 use crate::authenticated_tree_ops::*;
 use crate::batch_node::*;
 use crate::operation::*;
+use alloc::rc::Rc;
 use alloc::vec;
 use alloc::vec::Vec;
 use anyhow::Result;
@@ -171,9 +172,26 @@ impl BatchAVLProver {
         // boundary. If the caller needs a reset, the preview resets only its
         // own graph on its first operation; an in-flight caller keeps its
         // current flags so preview proof bytes match the real operation.
-        let tree_clone = self.base.tree.clone_with_independent_nodes();
+        let modified_nodes: Vec<NodeId> = self.base.modified_nodes.values().cloned().collect();
+        let (tree_clone, old_top_node, node_map) = self
+            .base
+            .tree
+            .clone_with_independent_nodes(&self.old_top_node, &modified_nodes);
         let mut new_prover = BatchAVLProver::new(tree_clone, false);
         new_prover.needs_cycle_reset = self.needs_cycle_reset;
+        new_prover.old_top_node = old_top_node;
+        new_prover.directions = self.directions.clone();
+        new_prover.directions_bit_length = self.directions_bit_length;
+        new_prover.base.modified_nodes = self
+            .base
+            .modified_nodes
+            .iter()
+            .filter_map(|(address, _)| {
+                node_map
+                    .get(address)
+                    .map(|node| (Rc::as_ptr(node) as usize, node.clone()))
+            })
+            .collect();
         for op in operations.iter() {
             new_prover.perform_one_operation(op)?;
         }

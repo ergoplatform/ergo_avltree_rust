@@ -211,7 +211,7 @@ fn preview_keeps_an_in_flight_persistence_cycle_unchanged() {
     let changed_to_check_before = node_ids(&prover.base.changed_nodes_buffer_to_check);
     let modified_before: Vec<usize> = prover.base.modified_nodes.keys().copied().collect();
 
-    prover
+    let (preview_proof, preview_digest) = prover
         .generate_proof_for_operations(&vec![preview.clone()])
         .unwrap();
 
@@ -227,19 +227,23 @@ fn preview_keeps_an_in_flight_persistence_cycle_unchanged() {
         changed_to_check_before
     );
     assert_eq!(
-        prover.base.modified_nodes.keys().copied().collect::<Vec<_>>(),
+        prover
+            .base
+            .modified_nodes
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
         modified_before
     );
-    assert_eq!(prover.unauthenticated_lookup(&applied.key), Some(applied.value));
+    assert_eq!(
+        prover.unauthenticated_lookup(&applied.key),
+        Some(applied.value)
+    );
     assert!(prover.unauthenticated_lookup(&preview.key()).is_none());
 
-    let mut proof_prover = generate_prover(KEY_LENGTH, Some(8));
-    let (preview_proof, preview_digest) = proof_prover
-        .generate_proof_for_operations(&vec![preview.clone()])
-        .unwrap();
-    proof_prover.perform_one_operation(&preview).unwrap();
-    assert_eq!(proof_prover.generate_proof(), preview_proof);
-    assert_eq!(proof_prover.digest().unwrap(), preview_digest);
+    prover.perform_one_operation(&preview).unwrap();
+    assert_eq!(prover.generate_proof(), preview_proof);
+    assert_eq!(prover.digest().unwrap(), preview_digest);
 }
 
 #[test]
@@ -268,7 +272,9 @@ fn preview_does_not_mutate_lazy_resolver_cache_children() {
         key: Bytes::from(vec![0x10; KEY_LENGTH]),
         value: Bytes::from(vec![0xCC; 8]),
     });
-    prover.generate_proof_for_operations(&vec![operation]).unwrap();
+    prover
+        .generate_proof_for_operations(&vec![operation])
+        .unwrap();
 
     assert_eq!(lazy_cache_snapshot(), cache_before);
 }

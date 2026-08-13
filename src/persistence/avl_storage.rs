@@ -147,21 +147,17 @@ impl VersionedAVLStorage for RedbAVLStorage {
         let height_bytes = (height as u64).to_le_bytes();
         let root_label_vec = root_label.to_vec();
 
-        // Q2 FIX: Filter out content-addressed nodes that already exist in DB.
-        // Since keys are Blake2b hashes, if the key exists, the content is
-        // guaranteed identical (content-addressed = idempotent). This eliminates
-        // 100% of write amplification from re-persisting unchanged nodes.
-        let mut to_insert: Vec<(&[u8], &[u8])> = Vec::new();
-        for (key, value) in &node_pairs {
-            if self.store.get_node(key)?.is_none() {
-                to_insert.push((key.as_slice(), value.as_slice()));
-            }
+        if new_digest.len() != 33
+            || new_digest[..32] != root_label_vec
+            || new_digest[32] as usize != height
+        {
+            return Err(anyhow!(
+                "Prover digest does not match its AVL root metadata"
+            ));
         }
-        // Metadata keys ALWAYS update (not content-addressed)
-        to_insert.push((TOP_NODE_HASH_KEY, root_label_vec.as_slice()));
-        to_insert.push((TOP_NODE_HEIGHT_KEY, &height_bytes));
 
-        // Collect removed node labels
+        // Collect removed node labels before deciding whether this update is a
+        // verified proof-only no-op or a new persisted version.
         let removed = prover.removed_nodes();
         let removed_labels: Vec<Vec<u8>> = removed
             .iter()
@@ -176,6 +172,35 @@ impl VersionedAVLStorage for RedbAVLStorage {
             })
             .collect::<Result<_>>()?;
         let to_remove: Vec<&[u8]> = removed_labels.iter().map(|l| l.as_slice()).collect();
+
+        // A proof-only batch such as Lookup can leave the AVL digest unchanged.
+        // Coalesce it only after verifying every materialized node, root
+        // metadata entry, and removal candidate against the persisted tip.
+        if self.store.last_version_id()?.as_deref() == Some(new_digest.as_ref()) {
+            let mut expected_entries: Vec<(&[u8], &[u8])> = node_pairs
+                .iter()
+                .map(|(key, value)| (key.as_slice(), value.as_slice()))
+                .collect();
+            expected_entries.push((TOP_NODE_HASH_KEY, root_label_vec.as_slice()));
+            expected_entries.push((TOP_NODE_HEIGHT_KEY, &height_bytes));
+            self.store
+                .verify_current_state(&new_digest, &expected_entries, &to_remove)?;
+            return Ok(());
+        }
+
+        // Q2 FIX: Filter out content-addressed nodes that already exist in DB.
+        // Since keys are Blake2b hashes, if the key exists, the content is
+        // guaranteed identical (content-addressed = idempotent). This eliminates
+        // 100% of write amplification from re-persisting unchanged nodes.
+        let mut to_insert: Vec<(&[u8], &[u8])> = Vec::new();
+        for (key, value) in &node_pairs {
+            if self.store.get_node(key)?.is_none() {
+                to_insert.push((key.as_slice(), value.as_slice()));
+            }
+        }
+        // Metadata keys ALWAYS update (not content-addressed)
+        to_insert.push((TOP_NODE_HASH_KEY, root_label_vec.as_slice()));
+        to_insert.push((TOP_NODE_HEIGHT_KEY, &height_bytes));
 
         self.store.update(&new_digest, &to_insert, &to_remove)?;
         Ok(())

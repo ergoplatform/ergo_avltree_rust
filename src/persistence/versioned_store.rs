@@ -11,7 +11,7 @@
 //! - `UNDO_LOG_TABLE`: LSN → undo entry bytes
 //! - `VERSIONS_TABLE`: version_id → version record bytes
 
-use alloc::vec::Vec;
+use alloc::{collections::BTreeSet, vec::Vec};
 use anyhow::{anyhow, Result};
 use redb::{Database, ReadableTable, TableDefinition};
 use std::path::Path;
@@ -197,6 +197,55 @@ impl RedbVersionedStore {
         }
     }
 
+    /// Verify that a repeated AVL digest describes the exact current state.
+    ///
+    /// The low-level update API always rejects reused version IDs. The AVL
+    /// adapter may use this read-only check to coalesce a proof-only update
+    /// whose digest and persisted content are unchanged.
+    pub(crate) fn verify_current_state(
+        &self,
+        version_id: &[u8],
+        expected_entries: &[(&[u8], &[u8])],
+        expected_absent: &[&[u8]],
+    ) -> Result<()> {
+        let txn = self.db.begin_read()?;
+        let nodes = txn.open_table(NODES_TABLE)?;
+        let meta = txn.open_table(META_TABLE)?;
+        let versions = txn.open_table(VERSIONS_TABLE)?;
+
+        let current = meta
+            .get(META_LAST_VERSION)?
+            .map(|value| value.value().to_vec());
+        if current.as_deref() != Some(version_id) {
+            return Err(anyhow!("Version ID is not the current persistence tip"));
+        }
+        let record_bytes = versions
+            .get(version_id)?
+            .ok_or_else(|| anyhow!("Current persistence version record is missing"))?;
+        let record = VersionRecord::deserialize(record_bytes.value())?;
+        if record.version_id != version_id {
+            return Err(anyhow!("Version record ID does not match lookup key"));
+        }
+
+        for (key, expected_value) in expected_entries {
+            let stored = nodes.get(*key)?.map(|value| value.value().to_vec());
+            if stored.as_deref() != Some(*expected_value) {
+                return Err(anyhow!(
+                    "Repeated AVL digest does not match persisted state"
+                ));
+            }
+        }
+        for key in expected_absent {
+            if nodes.get(*key)?.is_some() {
+                return Err(anyhow!(
+                    "Repeated AVL digest conflicts with a persisted removal"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Atomically apply an update: insert/update/remove keys in NODES_TABLE,
     /// and record undo entries for rollback.
     ///
@@ -215,6 +264,10 @@ impl RedbVersionedStore {
             let mut undo_log = txn.open_table(UNDO_LOG_TABLE)?;
             let mut meta = txn.open_table(META_TABLE)?;
             let mut versions = txn.open_table(VERSIONS_TABLE)?;
+
+            if versions.get(version_id)?.is_some() {
+                return Err(anyhow!("Version ID already exists in history"));
+            }
 
             // Read next_lsn and parent version INSIDE the write txn (Q4 TOCTOU fix)
             let mut next_lsn = meta
@@ -293,15 +346,22 @@ impl RedbVersionedStore {
 
         let read_txn = self.db.begin_read()?;
         let versions_table = read_txn.open_table(VERSIONS_TABLE)?;
+        let mut visited = BTreeSet::new();
 
         loop {
             if cursor == target_version {
                 break;
             }
+            if !visited.insert(cursor.clone()) {
+                return Err(anyhow!("Cycle detected in version history"));
+            }
             let record_bytes = versions_table
                 .get(cursor.as_slice())?
                 .ok_or_else(|| anyhow!("Version not found in chain: {:?}", &cursor[..4]))?;
             let record = VersionRecord::deserialize(record_bytes.value())?;
+            if record.version_id != cursor {
+                return Err(anyhow!("Version record ID does not match lookup key"));
+            }
             versions_to_undo.push((record.start_lsn, record.end_lsn, record.version_id.clone()));
             cursor = record
                 .parent_version_id
@@ -377,12 +437,19 @@ impl RedbVersionedStore {
 
         let txn = self.db.begin_read()?;
         let versions_table = txn.open_table(VERSIONS_TABLE)?;
+        let mut visited = BTreeSet::new();
 
         while let Some(vid) = cursor {
+            if !visited.insert(vid.clone()) {
+                return Err(anyhow!("Cycle detected in version history"));
+            }
             versions.push(vid.clone());
             match versions_table.get(vid.as_slice())? {
                 Some(record_bytes) => {
                     let record = VersionRecord::deserialize(record_bytes.value())?;
+                    if record.version_id != vid {
+                        return Err(anyhow!("Version record ID does not match lookup key"));
+                    }
                     cursor = record.parent_version_id;
                 }
                 None => break,
@@ -395,7 +462,31 @@ impl RedbVersionedStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
+    use alloc::vec;
     use tempfile::tempdir;
+
+    fn version_record(store: &RedbVersionedStore, version_id: &[u8]) -> VersionRecord {
+        let txn = store.db.begin_read().unwrap();
+        let versions = txn.open_table(VERSIONS_TABLE).unwrap();
+        let bytes = versions.get(version_id).unwrap().unwrap().value().to_vec();
+        VersionRecord::deserialize(&bytes).unwrap()
+    }
+
+    fn replace_version_record(
+        store: &RedbVersionedStore,
+        version_id: &[u8],
+        record: &VersionRecord,
+    ) {
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut versions = txn.open_table(VERSIONS_TABLE).unwrap();
+            versions
+                .insert(version_id, record.serialize().as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+    }
 
     #[test]
     fn test_basic_insert_and_read() {
@@ -522,5 +613,107 @@ mod tests {
         assert_eq!(versions[0], b"v3");
         assert_eq!(versions[1], b"v2");
         assert_eq!(versions[2], b"v1");
+    }
+
+    #[test]
+    fn test_duplicate_tip_version_id_is_rejected_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+
+        store
+            .update(b"v1", &[(b"key".as_slice(), b"value".as_slice())], &[])
+            .unwrap();
+        let error = store
+            .update(b"v1", &[(b"key".as_slice(), b"value".as_slice())], &[])
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "Version ID already exists in history");
+        assert_eq!(store.get_node(b"key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(store.last_version_id().unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(version_record(&store, b"v1").parent_version_id, None);
+        assert_eq!(store.rollback_versions().unwrap(), vec![b"v1".to_vec()]);
+    }
+
+    #[test]
+    fn test_duplicate_tip_conflict_is_rejected_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+
+        store
+            .update(b"v1", &[(b"key".as_slice(), b"value".as_slice())], &[])
+            .unwrap();
+
+        let error = store
+            .update(b"v1", &[(b"key".as_slice(), b"different".as_slice())], &[])
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "Version ID already exists in history");
+        assert_eq!(store.get_node(b"key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(store.last_version_id().unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(store.rollback_versions().unwrap(), vec![b"v1".to_vec()]);
+    }
+
+    #[test]
+    fn test_historical_version_recurrence_is_rejected_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+
+        store
+            .update(b"v0", &[(b"key".as_slice(), b"zero".as_slice())], &[])
+            .unwrap();
+        store
+            .update(b"v1", &[(b"key".as_slice(), b"one".as_slice())], &[])
+            .unwrap();
+
+        let error = store
+            .update(b"v0", &[(b"key".as_slice(), b"zero".as_slice())], &[])
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "Version ID already exists in history");
+        assert_eq!(store.get_node(b"key").unwrap(), Some(b"one".to_vec()));
+        assert_eq!(store.last_version_id().unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(
+            store.rollback_versions().unwrap(),
+            vec![b"v1".to_vec(), b"v0".to_vec()]
+        );
+        store.rollback(b"v0").unwrap();
+        assert_eq!(store.get_node(b"key").unwrap(), Some(b"zero".to_vec()));
+    }
+
+    #[test]
+    fn test_rollback_rejects_version_record_key_mismatch() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+
+        store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+        store.update(b"v1", &[(b"key", b"one")], &[]).unwrap();
+
+        let mut record = version_record(&store, b"v1");
+        record.version_id = b"wrong".to_vec();
+        replace_version_record(&store, b"v1", &record);
+
+        let error = store.rollback(b"v0").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Version record ID does not match lookup key"
+        );
+        assert_eq!(store.last_version_id().unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(store.get_node(b"key").unwrap(), Some(b"one".to_vec()));
+    }
+
+    #[test]
+    fn test_rollback_versions_rejects_cycle() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+
+        store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+        store.update(b"v1", &[(b"key", b"one")], &[]).unwrap();
+
+        let mut record = version_record(&store, b"v0");
+        record.parent_version_id = Some(b"v1".to_vec());
+        replace_version_record(&store, b"v0", &record);
+
+        let error = store.rollback_versions().unwrap_err();
+        assert_eq!(error.to_string(), "Cycle detected in version history");
     }
 }

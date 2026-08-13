@@ -363,4 +363,55 @@ mod persistence_tests {
         assert_eq!(branch_verifier.digest().unwrap(), branch_digest);
         reloaded.storage.flush().unwrap();
     }
+
+    #[test]
+    fn test_lookup_persist_is_an_idempotent_tip_update() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("avl.redb");
+        let key = blake2b_key(42);
+        let value = Bytes::from("value");
+
+        let mut persistent = new_persistent_prover(&db_path);
+        persistent
+            .perform_one_operation(&Operation::Insert(KeyValue {
+                key: key.clone(),
+                value: value.clone(),
+            }))
+            .unwrap();
+        persistent
+            .generate_proof_and_update_storage(vec![])
+            .unwrap();
+        let digest = persistent.digest();
+        let versions_before: Vec<_> = persistent.storage.rollback_versions().collect();
+
+        assert_eq!(
+            persistent
+                .perform_one_operation(&Operation::Lookup(key.clone()))
+                .unwrap(),
+            Some(value.clone())
+        );
+        let lookup_proof = persistent
+            .generate_proof_and_update_storage(vec![])
+            .unwrap();
+
+        assert_eq!(persistent.digest(), digest);
+        assert_eq!(
+            persistent.storage.rollback_versions().collect::<Vec<_>>(),
+            versions_before
+        );
+        let mut verifier = new_verifier(&digest, &lookup_proof);
+        assert_eq!(
+            verifier
+                .perform_one_operation(&Operation::Lookup(key.clone()))
+                .unwrap(),
+            Some(value.clone())
+        );
+        assert_eq!(verifier.digest().unwrap(), digest);
+        persistent.storage.flush().unwrap();
+        drop(persistent);
+
+        let reloaded = new_persistent_prover(&db_path);
+        assert_eq!(reloaded.digest(), digest);
+        assert_eq!(reloaded.unauthenticated_lookup(&key), Some(value));
+    }
 }

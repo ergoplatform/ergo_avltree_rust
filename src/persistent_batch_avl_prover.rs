@@ -19,7 +19,7 @@ impl PersistentBatchAVLProver {
         additional_data: Vec<(ADKey, ADValue)>,
     ) -> Result<PersistentBatchAVLProver> {
         let mut this = PersistentBatchAVLProver { prover, storage };
-        match this.storage.version() {
+        match this.storage.try_version()? {
             Some(ver) => {
                 let _ = this.rollback(&ver)?;
             }
@@ -27,7 +27,10 @@ impl PersistentBatchAVLProver {
                 let _ = this.generate_proof_and_update_storage(additional_data)?;
             }
         }
-        ensure!(this.storage.version().unwrap() == this.digest());
+        ensure!(
+            this.storage.try_version()? == Some(this.digest()),
+            "Persistent storage version does not match prover digest"
+        );
         Ok(this)
     }
 

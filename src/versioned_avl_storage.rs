@@ -34,6 +34,11 @@ pub trait VersionedAVLStorage {
     ///
     fn version(&self) -> Option<ADDigest>;
 
+    /// Fallible current-version query for stores whose metadata can be corrupt.
+    fn try_version(&self) -> Result<Option<ADDigest>> {
+        Ok(self.version())
+    }
+
     ///
     /// If storage is empty
     ///
@@ -53,6 +58,11 @@ pub trait VersionedAVLStorage {
     /// @return versions store keeps
     ///
     fn rollback_versions<'a>(&'a self) -> Box<dyn Iterator<Item = ADDigest> + 'a>;
+
+    /// Fallible version-history query for stores backed by persistent data.
+    fn try_rollback_versions<'a>(&'a self) -> Result<Box<dyn Iterator<Item = ADDigest> + 'a>> {
+        Ok(self.rollback_versions())
+    }
 
     ////
     /// Force a durable commit of outstanding writes. Implementations that

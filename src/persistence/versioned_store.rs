@@ -11,7 +11,7 @@
 //! - `UNDO_LOG_TABLE`: LSN → undo entry bytes
 //! - `VERSIONS_TABLE`: version_id → version record bytes
 
-use alloc::{collections::BTreeSet, vec::Vec};
+use alloc::{collections::BTreeMap, collections::BTreeSet, vec::Vec};
 use anyhow::{anyhow, Result};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::Path;
@@ -119,6 +119,7 @@ impl UndoEntry {
 }
 
 /// Metadata for a version checkpoint, forming a linked list for rollback traversal.
+#[derive(Clone)]
 struct VersionRecord {
     /// Hash digest identifying this version
     version_id: Vec<u8>,
@@ -132,6 +133,9 @@ struct VersionRecord {
 
 impl VersionRecord {
     fn serialize(&self) -> Result<Vec<u8>> {
+        if self.start_lsn > self.end_lsn {
+            return Err(anyhow!("VersionRecord has an invalid LSN range"));
+        }
         let mut buf = Vec::new();
         // version_id_len + version_id
         let version_len = u32::try_from(self.version_id.len())
@@ -185,12 +189,121 @@ impl VersionRecord {
     }
 }
 
-fn validate_metadata_state(
+struct ValidatedState {
+    /// Active records ordered from the current tip back to genesis.
+    records: Vec<VersionRecord>,
+}
+
+fn validate_table_snapshot(
     last_version: Option<Vec<u8>>,
     next_lsn_bytes: Option<Vec<u8>>,
+    nodes_empty: bool,
+    versions: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    undo_log: &impl ReadableTable<u64, &'static [u8]>,
+) -> Result<Option<ValidatedState>> {
+    match (last_version, next_lsn_bytes) {
+        (None, None) => {
+            if !versions.is_empty()? {
+                return Err(anyhow!("Redb metadata is empty but version records remain"));
+            }
+            if !undo_log.is_empty()? {
+                return Err(anyhow!(
+                    "Redb metadata is empty but undo-log entries remain"
+                ));
+            }
+            if !nodes_empty {
+                return Err(anyhow!("Redb metadata is empty but node entries remain"));
+            }
+            Ok(None)
+        }
+        (Some(_), None) => Err(anyhow!("Redb metadata has a version without next LSN")),
+        (None, Some(_)) => Err(anyhow!("Redb metadata has a next LSN without version")),
+        (Some(tip), Some(next_lsn_bytes)) => {
+            let encoded_next_lsn: [u8; 8] = next_lsn_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("Persisted next LSN must be exactly 8 bytes"))?;
+            let next_lsn = u64::from_le_bytes(encoded_next_lsn);
+            let mut cursor = tip;
+            let mut expected_next_lsn = next_lsn;
+            let mut visited = BTreeSet::new();
+            let mut records = Vec::new();
+            loop {
+                if !visited.insert(cursor.clone()) {
+                    return Err(anyhow!("Cycle detected in version history"));
+                }
+                let record_bytes = versions
+                    .get(cursor.as_slice())?
+                    .map(|value| value.value().to_vec())
+                    .ok_or_else(|| anyhow!("Version record is missing from history"))?;
+                let record = VersionRecord::deserialize(&record_bytes)?;
+                if record.version_id != cursor {
+                    return Err(anyhow!("Version record ID does not match lookup key"));
+                }
+                let record_next_lsn = record
+                    .end_lsn
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("Undo-log LSN overflow"))?;
+                if record_next_lsn != expected_next_lsn {
+                    return Err(anyhow!("Version undo-log ranges are not contiguous"));
+                }
+                expected_next_lsn = record.start_lsn;
+                let parent = record.parent_version_id.clone();
+                records.push(record);
+                match parent {
+                    Some(parent) => cursor = parent,
+                    None => {
+                        if expected_next_lsn != 0 {
+                            return Err(anyhow!("Genesis version must start at undo-log LSN zero"));
+                        }
+                        break;
+                    }
+                }
+            }
+            if u64::try_from(visited.len())? != versions.len()? {
+                return Err(anyhow!(
+                    "Version table contains a record outside the active history"
+                ));
+            }
+
+            let mut expected_lsn = 0u64;
+            for entry in undo_log.iter()? {
+                let (key, value) = entry?;
+                let lsn = key.value();
+                if lsn != expected_lsn {
+                    if lsn >= next_lsn {
+                        return Err(anyhow!(
+                            "Undo-log contains an entry outside the active version history"
+                        ));
+                    }
+                    return Err(anyhow!("Undo-log entry is missing"));
+                }
+                UndoEntry::deserialize(value.value())?;
+                expected_lsn = expected_lsn
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("Undo-log LSN overflow"))?;
+            }
+            if expected_lsn < next_lsn {
+                return Err(anyhow!("Undo-log entry is missing"));
+            }
+            if expected_lsn > next_lsn {
+                return Err(anyhow!(
+                    "Undo-log contains an entry outside the active version history"
+                ));
+            }
+            Ok(Some(ValidatedState { records }))
+        }
+    }
+}
+
+fn validate_tip_state(
+    last_version: Option<Vec<u8>>,
+    next_lsn_bytes: Option<Vec<u8>>,
+    nodes_empty: bool,
     tip_record_bytes: Option<Vec<u8>>,
     versions_empty: bool,
     undo_empty: bool,
+    undo_at_next_lsn: bool,
 ) -> Result<Option<(Vec<u8>, u64)>> {
     match (last_version, next_lsn_bytes) {
         (None, None) => {
@@ -201,6 +314,9 @@ fn validate_metadata_state(
                 return Err(anyhow!(
                     "Redb metadata is empty but undo-log entries remain"
                 ));
+            }
+            if !nodes_empty {
+                return Err(anyhow!("Redb metadata is empty but node entries remain"));
             }
             Ok(None)
         }
@@ -225,9 +341,93 @@ fn validate_metadata_state(
             if expected_next_lsn != next_lsn {
                 return Err(anyhow!("Redb tip record end LSN does not match next LSN"));
             }
+            if undo_at_next_lsn {
+                return Err(anyhow!(
+                    "Undo-log contains an entry outside the active version history"
+                ));
+            }
             Ok(Some((tip, next_lsn)))
         }
     }
+}
+
+fn validate_tip_tables(
+    last_version: Option<Vec<u8>>,
+    next_lsn_bytes: Option<Vec<u8>>,
+    nodes_empty: bool,
+    versions: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    undo_log: &impl ReadableTable<u64, &'static [u8]>,
+) -> Result<Option<(Vec<u8>, u64)>> {
+    let mut tip_record_bytes = None;
+    let mut undo_at_next_lsn = false;
+    if let (Some(tip), Some(next_bytes)) = (last_version.as_deref(), next_lsn_bytes.as_deref()) {
+        let encoded_next_lsn: [u8; 8] = next_bytes
+            .try_into()
+            .map_err(|_| anyhow!("Persisted next LSN must be exactly 8 bytes"))?;
+        let next_lsn = u64::from_le_bytes(encoded_next_lsn);
+        undo_at_next_lsn = undo_log.get(next_lsn)?.is_some();
+        tip_record_bytes = versions.get(tip)?.map(|value| value.value().to_vec());
+    }
+    let tip_state = validate_tip_state(
+        last_version.clone(),
+        next_lsn_bytes.clone(),
+        nodes_empty,
+        tip_record_bytes.clone(),
+        versions.is_empty()?,
+        undo_log.is_empty()?,
+        undo_at_next_lsn,
+    )?;
+    if let Some(record_bytes) = tip_record_bytes.as_deref() {
+        let record = VersionRecord::deserialize(record_bytes)?;
+        let mut expected_lsn = record.start_lsn;
+        for entry in undo_log.range(record.start_lsn..=record.end_lsn)? {
+            let (key, value) = entry?;
+            if key.value() != expected_lsn {
+                return Err(anyhow!("Undo-log entry is missing"));
+            }
+            UndoEntry::deserialize(value.value())?;
+            expected_lsn = expected_lsn
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("Undo-log LSN overflow"))?;
+        }
+        let record_next_lsn = record
+            .end_lsn
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Undo-log LSN overflow"))?;
+        if expected_lsn != record_next_lsn {
+            return Err(anyhow!("Undo-log entry is missing"));
+        }
+    }
+    Ok(tip_state)
+}
+
+fn deduplicate_updates<'a>(entries: &[(&'a [u8], &'a [u8])]) -> Result<Vec<(&'a [u8], &'a [u8])>> {
+    let mut unique = Vec::new();
+    let mut seen = BTreeMap::new();
+    for &(key, value) in entries {
+        if let Some(previous_value) = seen.get(key) {
+            if *previous_value != value {
+                return Err(anyhow!(
+                    "Update contains duplicate keys with different values"
+                ));
+            }
+        } else {
+            seen.insert(key, value);
+            unique.push((key, value));
+        }
+    }
+    Ok(unique)
+}
+
+fn deduplicate_keys<'a>(keys: &[&'a [u8]]) -> Vec<&'a [u8]> {
+    let mut unique = Vec::new();
+    let mut seen = BTreeSet::new();
+    for &key in keys {
+        if seen.insert(key) {
+            unique.push(key);
+        }
+    }
+    unique
 }
 
 /// A versioned key-value store backed by `redb` with undo-log rollback.
@@ -254,12 +454,14 @@ impl RedbVersionedStore {
         }
         txn.commit()?;
 
-        Ok(RedbVersionedStore { db })
+        let store = RedbVersionedStore { db };
+        store.validate_current_snapshot()?;
+        Ok(store)
     }
 
-    /// Get the last version ID, or None if store is empty.
-    pub fn last_version_id(&self) -> Result<Option<Vec<u8>>> {
+    fn validate_current_snapshot(&self) -> Result<Option<ValidatedState>> {
         let txn = self.db.begin_read()?;
+        let nodes = txn.open_table(NODES_TABLE)?;
         let meta = txn.open_table(META_TABLE)?;
         let versions = txn.open_table(VERSIONS_TABLE)?;
         let undo_log = txn.open_table(UNDO_LOG_TABLE)?;
@@ -267,18 +469,37 @@ impl RedbVersionedStore {
             .get(META_LAST_VERSION)?
             .map(|value| value.value().to_vec());
         let next_lsn = meta.get(META_NEXT_LSN)?.map(|value| value.value().to_vec());
-        let tip_record = match last_version.as_deref() {
-            Some(tip) => versions.get(tip)?.map(|value| value.value().to_vec()),
-            None => None,
-        };
-        Ok(validate_metadata_state(
+        validate_table_snapshot(
             last_version,
             next_lsn,
-            tip_record,
-            versions.is_empty()?,
-            undo_log.is_empty()?,
-        )?
-        .map(|(tip, _)| tip))
+            nodes.is_empty()?,
+            &versions,
+            &undo_log,
+        )
+    }
+
+    fn current_tip_fast(&self) -> Result<Option<(Vec<u8>, u64)>> {
+        let txn = self.db.begin_read()?;
+        let nodes = txn.open_table(NODES_TABLE)?;
+        let meta = txn.open_table(META_TABLE)?;
+        let versions = txn.open_table(VERSIONS_TABLE)?;
+        let undo_log = txn.open_table(UNDO_LOG_TABLE)?;
+        let last_version = meta
+            .get(META_LAST_VERSION)?
+            .map(|value| value.value().to_vec());
+        let next_lsn = meta.get(META_NEXT_LSN)?.map(|value| value.value().to_vec());
+        validate_tip_tables(
+            last_version,
+            next_lsn,
+            nodes.is_empty()?,
+            &versions,
+            &undo_log,
+        )
+    }
+
+    /// Get the last version ID, or None if store is empty.
+    pub fn last_version_id(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.current_tip_fast()?.map(|(tip, _)| tip))
     }
 
     /// Read a node by its hash key.
@@ -364,16 +585,12 @@ impl RedbVersionedStore {
             .get(META_LAST_VERSION)?
             .map(|value| value.value().to_vec());
         let next_lsn = meta.get(META_NEXT_LSN)?.map(|value| value.value().to_vec());
-        let tip_record = match last_version.as_deref() {
-            Some(tip) => versions.get(tip)?.map(|value| value.value().to_vec()),
-            None => None,
-        };
-        let current = validate_metadata_state(
+        let current = validate_tip_tables(
             last_version,
             next_lsn,
-            tip_record,
-            versions.is_empty()?,
-            undo_log.is_empty()?,
+            nodes.is_empty()?,
+            &versions,
+            &undo_log,
         )?;
         if current.as_ref().map(|(tip, _)| tip.as_slice()) != Some(version_id) {
             return Err(anyhow!("Version ID is not the current persistence tip"));
@@ -419,6 +636,34 @@ impl RedbVersionedStore {
         upserts: &[(&[u8], &[u8])],
         to_remove: &[&[u8]],
     ) -> Result<()> {
+        let content_addressed = deduplicate_updates(content_addressed)?;
+        let upserts = deduplicate_updates(upserts)?;
+        let to_remove = deduplicate_keys(to_remove);
+        let mut upserts_by_key = BTreeMap::new();
+        for &(key, value) in &upserts {
+            upserts_by_key.insert(key, value);
+        }
+        let removals_by_key: BTreeSet<&[u8]> = to_remove.iter().copied().collect();
+        for (content_key, content_value) in &content_addressed {
+            if let Some(upsert_value) = upserts_by_key.get(content_key) {
+                if *upsert_value != *content_value {
+                    return Err(anyhow!(
+                        "Update key has conflicting values across mutation classes"
+                    ));
+                }
+                return Err(anyhow!(
+                    "Update key appears in incompatible mutation classes"
+                ));
+            }
+        }
+        for (upsert_key, _) in &upserts {
+            if removals_by_key.contains(upsert_key) {
+                return Err(anyhow!(
+                    "Update key appears in incompatible mutation classes"
+                ));
+            }
+        }
+
         let txn = self.db.begin_write()?;
         let update_result = (|| -> Result<()> {
             let mut nodes = txn.open_table(NODES_TABLE)?;
@@ -430,16 +675,12 @@ impl RedbVersionedStore {
                 .get(META_LAST_VERSION)?
                 .map(|value| value.value().to_vec());
             let next_lsn_bytes = meta.get(META_NEXT_LSN)?.map(|value| value.value().to_vec());
-            let tip_record = match last_version.as_deref() {
-                Some(tip) => versions.get(tip)?.map(|value| value.value().to_vec()),
-                None => None,
-            };
-            let metadata_state = validate_metadata_state(
+            let metadata_state = validate_tip_tables(
                 last_version,
                 next_lsn_bytes,
-                tip_record,
-                versions.is_empty()?,
-                undo_log.is_empty()?,
+                nodes.is_empty()?,
+                &versions,
+                &undo_log,
             )?;
             let (parent_version, mut next_lsn) = match metadata_state {
                 Some((tip, next_lsn)) => (Some(tip), next_lsn),
@@ -451,7 +692,7 @@ impl RedbVersionedStore {
                 return Err(anyhow!("Version ID already exists in history"));
             }
 
-            for (key, value) in content_addressed {
+            for (key, value) in &content_addressed {
                 if let Some(stored) = nodes.get(*key)? {
                     if stored.value() != *value {
                         return Err(anyhow!(
@@ -462,7 +703,7 @@ impl RedbVersionedStore {
             }
 
             // Record undo entries for removals
-            for key in to_remove {
+            for key in &to_remove {
                 let old_value = nodes.get(*key)?.map(|v| v.value().to_vec());
                 if old_value.is_some() {
                     let undo = UndoEntry {
@@ -470,6 +711,9 @@ impl RedbVersionedStore {
                         old_value,
                     };
                     let encoded = undo.serialize()?;
+                    if undo_log.get(next_lsn)?.is_some() {
+                        return Err(anyhow!("Undo-log LSN is already occupied"));
+                    }
                     undo_log.insert(next_lsn, encoded.as_slice())?;
                     next_lsn = next_lsn
                         .checked_add(1)
@@ -480,7 +724,7 @@ impl RedbVersionedStore {
 
             // Insert content only when it is absent after removals. Recheck the
             // exact bytes so duplicate keys in this batch cannot disagree.
-            for (key, value) in content_addressed {
+            for (key, value) in &content_addressed {
                 let stored = {
                     let guard = nodes.get(*key)?;
                     guard.map(|value| value.value().to_vec())
@@ -499,6 +743,9 @@ impl RedbVersionedStore {
                             old_value: None,
                         };
                         let encoded = undo.serialize()?;
+                        if undo_log.get(next_lsn)?.is_some() {
+                            return Err(anyhow!("Undo-log LSN is already occupied"));
+                        }
                         undo_log.insert(next_lsn, encoded.as_slice())?;
                         next_lsn = next_lsn
                             .checked_add(1)
@@ -509,13 +756,16 @@ impl RedbVersionedStore {
             }
 
             // Metadata and other ordinary entries are always upserted.
-            for (key, value) in upserts {
+            for (key, value) in &upserts {
                 let old_value = nodes.get(*key)?.map(|v| v.value().to_vec());
                 let undo = UndoEntry {
                     key: key.to_vec(),
                     old_value,
                 };
                 let encoded = undo.serialize()?;
+                if undo_log.get(next_lsn)?.is_some() {
+                    return Err(anyhow!("Undo-log LSN is already occupied"));
+                }
                 undo_log.insert(next_lsn, encoded.as_slice())?;
                 next_lsn = next_lsn
                     .checked_add(1)
@@ -587,68 +837,27 @@ impl RedbVersionedStore {
                 .get(META_LAST_VERSION)?
                 .map(|value| value.value().to_vec());
             let next_lsn = meta.get(META_NEXT_LSN)?.map(|value| value.value().to_vec());
-            let tip_record = match last_version.as_deref() {
-                Some(tip) => versions.get(tip)?.map(|value| value.value().to_vec()),
-                None => None,
-            };
-            let (current_version, current_next_lsn) = validate_metadata_state(
+            let state = validate_table_snapshot(
                 last_version,
                 next_lsn,
-                tip_record,
-                versions.is_empty()?,
-                undo_log.is_empty()?,
+                nodes.is_empty()?,
+                &versions,
+                &undo_log,
             )?
             .ok_or_else(|| anyhow!("Store is empty, cannot rollback"))?;
-
-            let target_data = versions
-                .get(target_version)?
-                .map(|value| value.value().to_vec())
+            let target_index = state
+                .records
+                .iter()
+                .position(|record| record.version_id.as_slice() == target_version)
                 .ok_or_else(|| anyhow!("Target version record is missing"))?;
-            let target_record = VersionRecord::deserialize(&target_data)?;
-            if target_record.version_id != target_version {
-                return Err(anyhow!("Version record ID does not match lookup key"));
-            }
-
-            let mut versions_to_undo = Vec::new();
-            let mut cursor = current_version;
-            let mut visited = BTreeSet::new();
-            let mut expected_next_lsn = current_next_lsn;
-            while cursor != target_version {
-                if !visited.insert(cursor.clone()) {
-                    return Err(anyhow!("Cycle detected in version history"));
-                }
-                let record_data = versions
-                    .get(cursor.as_slice())?
-                    .map(|value| value.value().to_vec())
-                    .ok_or_else(|| anyhow!("Version record is missing from rollback chain"))?;
-                let record = VersionRecord::deserialize(&record_data)?;
-                if record.version_id != cursor {
-                    return Err(anyhow!("Version record ID does not match lookup key"));
-                }
-                let record_next_lsn = record
-                    .end_lsn
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow!("Undo-log LSN overflow"))?;
-                if record_next_lsn != expected_next_lsn {
-                    return Err(anyhow!("Version undo-log ranges are not contiguous"));
-                }
-                expected_next_lsn = record.start_lsn;
-                cursor = record
-                    .parent_version_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("Reached genesis without finding target version"))?;
-                versions_to_undo.push(record);
-            }
-
+            let target_record = state.records[target_index].clone();
+            let versions_to_undo = &state.records[..target_index];
             let target_next_lsn = target_record
                 .end_lsn
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("Undo-log LSN overflow"))?;
-            if target_next_lsn != expected_next_lsn {
-                return Err(anyhow!("Target version undo-log range is not contiguous"));
-            }
 
-            for record in &versions_to_undo {
+            for record in versions_to_undo {
                 let mut lsn = record.end_lsn;
                 loop {
                     let entry_data = undo_log
@@ -715,8 +924,8 @@ impl RedbVersionedStore {
 
     /// Return all version IDs in reverse chronological order.
     pub fn rollback_versions(&self) -> Result<Vec<Vec<u8>>> {
-        let mut versions = Vec::new();
         let txn = self.db.begin_read()?;
+        let nodes = txn.open_table(NODES_TABLE)?;
         let versions_table = txn.open_table(VERSIONS_TABLE)?;
         let meta = txn.open_table(META_TABLE)?;
         let undo_log = txn.open_table(UNDO_LOG_TABLE)?;
@@ -724,37 +933,22 @@ impl RedbVersionedStore {
             .get(META_LAST_VERSION)?
             .map(|value| value.value().to_vec());
         let next_lsn = meta.get(META_NEXT_LSN)?.map(|value| value.value().to_vec());
-        let tip_record = match last_version.as_deref() {
-            Some(tip) => versions_table.get(tip)?.map(|value| value.value().to_vec()),
-            None => None,
-        };
-        let mut cursor = validate_metadata_state(
+        let state = validate_table_snapshot(
             last_version,
             next_lsn,
-            tip_record,
-            versions_table.is_empty()?,
-            undo_log.is_empty()?,
-        )?
-        .map(|(tip, _)| tip);
-        let mut visited = BTreeSet::new();
-
-        while let Some(vid) = cursor {
-            if !visited.insert(vid.clone()) {
-                return Err(anyhow!("Cycle detected in version history"));
-            }
-            match versions_table.get(vid.as_slice())? {
-                Some(record_bytes) => {
-                    let record = VersionRecord::deserialize(record_bytes.value())?;
-                    if record.version_id != vid {
-                        return Err(anyhow!("Version record ID does not match lookup key"));
-                    }
-                    versions.push(vid);
-                    cursor = record.parent_version_id;
-                }
-                None => return Err(anyhow!("Version record is missing from history")),
-            }
-        }
-        Ok(versions)
+            nodes.is_empty()?,
+            &versions_table,
+            &undo_log,
+        )?;
+        Ok(state
+            .map(|state| {
+                state
+                    .records
+                    .into_iter()
+                    .map(|record| record.version_id)
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
 
@@ -839,15 +1033,27 @@ mod tests {
             assert_decode_err_without_panic(|| VersionRecord::deserialize(&malformed));
         }
 
-        let invalid_range = VersionRecord {
+        let mut invalid_range = Vec::new();
+        invalid_range.extend_from_slice(&2u32.to_le_bytes());
+        invalid_range.extend_from_slice(b"v1");
+        invalid_range.push(0);
+        invalid_range.extend_from_slice(&2u64.to_le_bytes());
+        invalid_range.extend_from_slice(&1u64.to_le_bytes());
+        assert_decode_err_without_panic(|| VersionRecord::deserialize(&invalid_range));
+    }
+
+    #[test]
+    fn version_record_encoder_rejects_an_invalid_lsn_range() {
+        let record = VersionRecord {
             version_id: b"v1".to_vec(),
             parent_version_id: None,
             start_lsn: 2,
             end_lsn: 1,
-        }
-        .serialize()
-        .unwrap();
-        assert_decode_err_without_panic(|| VersionRecord::deserialize(&invalid_range));
+        };
+
+        let error = record.serialize().unwrap_err();
+
+        assert_eq!(error.to_string(), "VersionRecord has an invalid LSN range");
     }
 
     #[test]
@@ -962,10 +1168,79 @@ mod tests {
         txn.commit().unwrap();
     }
 
+    fn remove_undo_entry(store: &RedbVersionedStore, lsn: u64) {
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut undo = txn.open_table(UNDO_LOG_TABLE).unwrap();
+            undo.remove(lsn).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    fn replace_undo_entry_bytes(store: &RedbVersionedStore, lsn: u64, encoded: &[u8]) {
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut undo = txn.open_table(UNDO_LOG_TABLE).unwrap();
+            undo.insert(lsn, encoded).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
     fn has_undo_entry(store: &RedbVersionedStore, lsn: u64) -> bool {
         let txn = store.db.begin_read().unwrap();
         let undo = txn.open_table(UNDO_LOG_TABLE).unwrap();
         undo.get(lsn).unwrap().is_some()
+    }
+
+    fn raw_nodes(store: &RedbVersionedStore) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let txn = store.db.begin_read().unwrap();
+        let nodes = txn.open_table(NODES_TABLE).unwrap();
+        nodes
+            .iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                (key.value().to_vec(), value.value().to_vec())
+            })
+            .collect()
+    }
+
+    fn raw_versions(store: &RedbVersionedStore) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let txn = store.db.begin_read().unwrap();
+        let versions = txn.open_table(VERSIONS_TABLE).unwrap();
+        versions
+            .iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                (key.value().to_vec(), value.value().to_vec())
+            })
+            .collect()
+    }
+
+    fn raw_undo_log(store: &RedbVersionedStore) -> Vec<(u64, Vec<u8>)> {
+        let txn = store.db.begin_read().unwrap();
+        let undo = txn.open_table(UNDO_LOG_TABLE).unwrap();
+        undo.iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                (key.value(), value.value().to_vec())
+            })
+            .collect()
+    }
+
+    fn assert_raw_state_unchanged(
+        store: &RedbVersionedStore,
+        metadata: &(Option<Vec<u8>>, Option<Vec<u8>>),
+        nodes: &[(Vec<u8>, Vec<u8>)],
+        versions: &[(Vec<u8>, Vec<u8>)],
+        undo: &[(u64, Vec<u8>)],
+    ) {
+        assert_eq!(&raw_metadata(store), metadata);
+        assert_eq!(raw_nodes(store), nodes);
+        assert_eq!(raw_versions(store), versions);
+        assert_eq!(raw_undo_log(store), undo);
     }
 
     #[test]
@@ -1006,6 +1281,93 @@ mod tests {
         assert_eq!(raw_metadata(&store), (None, None));
         assert!(store.last_version_id().is_err());
         assert!(store.rollback_versions().is_err());
+    }
+
+    #[test]
+    fn empty_metadata_rejects_orphan_nodes_in_queries() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store
+            .replace_node_for_test(b"orphan", b"unversioned")
+            .unwrap();
+
+        let error = store.last_version_id().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Redb metadata is empty but node entries remain"
+        );
+        assert!(store.rollback_versions().is_err());
+    }
+
+    #[test]
+    fn empty_metadata_rejects_orphan_nodes_on_update_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store
+            .replace_node_for_test(b"orphan", b"unversioned")
+            .unwrap();
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store.update(b"v1", &[(b"key", b"value")], &[]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Redb metadata is empty but node entries remain"
+        );
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn open_rejects_a_corrupt_existing_snapshot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        {
+            let store = RedbVersionedStore::open(&path).unwrap();
+            store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+            insert_orphan_undo(&store, 1);
+        }
+
+        let error = match RedbVersionedStore::open(&path) {
+            Ok(_) => panic!("corrupt persistent state must fail during open"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Undo-log contains an entry outside the active version history"
+        );
+    }
+
+    #[test]
+    fn open_rejects_an_unversioned_node_in_an_otherwise_empty_store() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        {
+            let store = RedbVersionedStore::open(&path).unwrap();
+            store
+                .replace_node_for_test(b"orphan", b"unversioned")
+                .unwrap();
+        }
+
+        let error = match RedbVersionedStore::open(&path) {
+            Ok(_) => panic!("unversioned node state must fail during open"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Redb metadata is empty but node entries remain"
+        );
     }
 
     #[test]
@@ -1082,6 +1444,247 @@ mod tests {
             error.to_string(),
             "Redb tip record end LSN does not match next LSN"
         );
+    }
+
+    #[test]
+    fn update_rejects_an_orphan_undo_at_next_lsn_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+        insert_orphan_undo(&store, 1);
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store.update(b"v1", &[(b"key", b"one")], &[]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Undo-log contains an entry outside the active version history"
+        );
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn update_rejects_an_occupied_later_lsn_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"base", b"zero")], &[]).unwrap();
+        insert_orphan_undo(&store, 2);
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store
+            .update(b"v1", &[(b"one", b"1"), (b"two", b"2")], &[])
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "Undo-log LSN is already occupied");
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn queries_reject_an_orphan_undo_at_next_lsn() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+        insert_orphan_undo(&store, 1);
+
+        let error = store.last_version_id().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Undo-log contains an entry outside the active version history"
+        );
+        assert!(store.rollback_versions().is_err());
+    }
+
+    #[test]
+    fn history_query_rejects_an_orphan_version_beside_a_valid_tip() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+        insert_orphan_version(&store, b"orphan");
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store.rollback_versions().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Version table contains a record outside the active history"
+        );
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn update_partitioned_rejects_conflicting_class_overlap_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"base", b"zero")], &[]).unwrap();
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store
+            .update_partitioned(
+                b"v1",
+                &[(b"shared", b"content")],
+                &[(b"shared", b"metadata")],
+                &[],
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Update key has conflicting values across mutation classes"
+        );
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn update_partitioned_rejects_conflicting_duplicate_upserts_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"base", b"zero")], &[]).unwrap();
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store
+            .update_partitioned(b"v1", &[], &[(b"shared", b"one"), (b"shared", b"two")], &[])
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Update contains duplicate keys with different values"
+        );
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn update_partitioned_rejects_conflicting_duplicate_content_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"base", b"zero")], &[]).unwrap();
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store
+            .update_partitioned(b"v1", &[(b"shared", b"one"), (b"shared", b"two")], &[], &[])
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Update contains duplicate keys with different values"
+        );
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn update_partitioned_rejects_remove_and_upsert_overlap_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"shared", b"zero")], &[]).unwrap();
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store
+            .update_partitioned(b"v1", &[], &[(b"shared", b"one")], &[b"shared"])
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Update key appears in incompatible mutation classes"
+        );
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn update_partitioned_coalesces_identical_duplicates() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+
+        store
+            .update_partitioned(
+                b"v0",
+                &[(b"node", b"same"), (b"node", b"same")],
+                &[(b"meta", b"same"), (b"meta", b"same")],
+                &[b"missing", b"missing"],
+            )
+            .unwrap();
+
+        assert_eq!(store.get_node(b"node").unwrap(), Some(b"same".to_vec()));
+        assert_eq!(store.get_node(b"meta").unwrap(), Some(b"same".to_vec()));
+        let record = version_record(&store, b"v0");
+        assert_eq!((record.start_lsn, record.end_lsn), (0, 1));
+    }
+
+    #[test]
+    fn update_partitioned_allows_remove_then_reinsert_of_same_content() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"node", b"same")], &[]).unwrap();
+
+        store
+            .update_partitioned(b"v1", &[(b"node", b"same")], &[], &[b"node"])
+            .unwrap();
+
+        assert_eq!(store.get_node(b"node").unwrap(), Some(b"same".to_vec()));
+        store.rollback(b"v0").unwrap();
+        assert_eq!(store.get_node(b"node").unwrap(), Some(b"same".to_vec()));
     }
 
     #[test]
@@ -1170,6 +1773,193 @@ mod tests {
 
         store.rollback(b"v0").unwrap();
         assert_eq!(store.get_node(b"key").unwrap(), Some(b"zero".to_vec()));
+    }
+
+    #[test]
+    fn rollback_rejects_a_self_parented_target_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+        store.update(b"v1", &[(b"key", b"one")], &[]).unwrap();
+        let mut target = version_record(&store, b"v0");
+        target.parent_version_id = Some(b"v0".to_vec());
+        replace_version_record(&store, b"v0", &target);
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store.rollback(b"v0").unwrap_err();
+
+        assert_eq!(error.to_string(), "Cycle detected in version history");
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_a_genesis_range_that_does_not_start_at_zero() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+        let mut target = version_record(&store, b"v0");
+        target.start_lsn = 1;
+        target.end_lsn = 1;
+        replace_version_record(&store, b"v0", &target);
+        insert_orphan_undo(&store, 1);
+        let next = 2u64.to_le_bytes();
+        store
+            .set_metadata_for_test(Some(b"v0"), Some(&next))
+            .unwrap();
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store.rollback(b"v0").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Genesis version must start at undo-log LSN zero"
+        );
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_a_missing_retained_undo_entry_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+        store.update(b"v1", &[(b"key", b"one")], &[]).unwrap();
+        remove_undo_entry(&store, 0);
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store.rollback(b"v0").unwrap_err();
+
+        assert_eq!(error.to_string(), "Undo-log entry is missing");
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_a_malformed_retained_undo_entry_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+        store.update(b"v1", &[(b"key", b"one")], &[]).unwrap();
+        replace_undo_entry_bytes(&store, 0, &[0]);
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store.rollback(b"v0").unwrap_err();
+
+        assert_eq!(error.to_string(), "UndoEntry key length truncated");
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn rollback_to_current_still_validates_the_complete_ancestry() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+        store.update(b"v1", &[(b"key", b"one")], &[]).unwrap();
+        let mut genesis = version_record(&store, b"v0");
+        genesis.parent_version_id = Some(b"v0".to_vec());
+        replace_version_record(&store, b"v0", &genesis);
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store.rollback(b"v1").unwrap_err();
+
+        assert_eq!(error.to_string(), "Cycle detected in version history");
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn rollback_to_current_rejects_a_missing_retained_parent_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+        store.update(b"v1", &[(b"key", b"one")], &[]).unwrap();
+        remove_version_record(&store, b"v0");
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store.rollback(b"v1").unwrap_err();
+
+        assert_eq!(error.to_string(), "Version record is missing from history");
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
+    }
+
+    #[test]
+    fn rollback_to_current_rejects_noncontiguous_retained_ranges_atomically() {
+        let dir = tempdir().unwrap();
+        let store = RedbVersionedStore::open(&dir.path().join("test.redb")).unwrap();
+        store.update(b"v0", &[(b"key", b"zero")], &[]).unwrap();
+        store.update(b"v1", &[(b"key", b"one")], &[]).unwrap();
+        let mut genesis = version_record(&store, b"v0");
+        genesis.end_lsn = 2;
+        replace_version_record(&store, b"v0", &genesis);
+        let metadata_before = raw_metadata(&store);
+        let nodes_before = raw_nodes(&store);
+        let versions_before = raw_versions(&store);
+        let undo_before = raw_undo_log(&store);
+
+        let error = store.rollback(b"v1").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Version undo-log ranges are not contiguous"
+        );
+        assert_raw_state_unchanged(
+            &store,
+            &metadata_before,
+            &nodes_before,
+            &versions_before,
+            &undo_before,
+        );
     }
 
     #[test]

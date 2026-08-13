@@ -10,6 +10,7 @@ use crate::operation::*;
 use crate::persistence::versioned_store::RedbVersionedStore;
 use crate::versioned_avl_storage::VersionedAVLStorage;
 use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use anyhow::{anyhow, ensure, Result};
@@ -19,6 +20,13 @@ use std::path::Path;
 // Special keys in the node store for tree metadata
 const TOP_NODE_HASH_KEY: &[u8] = b"__top_node_hash__";
 const TOP_NODE_HEIGHT_KEY: &[u8] = b"__top_node_height__";
+
+struct ValidatedSubtree {
+    min_key: ADKey,
+    max_key: ADKey,
+    last_next_key: ADKey,
+    height: usize,
+}
 
 /// Persistent AVL storage backed by `redb`.
 ///
@@ -115,9 +123,204 @@ impl RedbAVLStorage {
         Ok(())
     }
 
+    fn validate_reachable_node(
+        lookup: &dyn Fn(&[u8]) -> Result<Option<Vec<u8>>>,
+        tree: &AVLTree,
+        expected_digest: &Digest32,
+        depth: usize,
+        active_path: &mut BTreeSet<Digest32>,
+    ) -> Result<(NodeId, ValidatedSubtree)> {
+        ensure!(
+            depth <= u8::MAX as usize,
+            "Persisted AVL depth exceeds digest encoding"
+        );
+        ensure!(
+            active_path.insert(*expected_digest),
+            "Cycle detected in reachable AVL nodes"
+        );
+
+        let result = (|| -> Result<(NodeId, ValidatedSubtree)> {
+            let data =
+                lookup(expected_digest)?.ok_or_else(|| anyhow!("Reachable AVL node is missing"))?;
+            let bytes = Bytes::from(data);
+            let node = Self::unpack_verified_node(tree, &bytes, expected_digest)?;
+            let node_value = node.borrow().clone();
+            let summary = match node_value {
+                Node::LabelOnly(_) => {
+                    return Err(anyhow!("Persisted AVL record remained unresolved"));
+                }
+                Node::Leaf(leaf) => {
+                    let key = leaf
+                        .hdr
+                        .key
+                        .ok_or_else(|| anyhow!("Persisted leaf key is missing"))?;
+                    ensure!(
+                        key < leaf.next_node_key,
+                        "Persisted AVL leaf key must precede its next key"
+                    );
+                    ValidatedSubtree {
+                        min_key: key.clone(),
+                        max_key: key,
+                        last_next_key: leaf.next_node_key,
+                        height: 0,
+                    }
+                }
+                Node::Internal(internal) => {
+                    let separator = internal
+                        .hdr
+                        .key
+                        .ok_or_else(|| anyhow!("Persisted internal separator is missing"))?;
+                    let left_digest = Self::cached_label(&internal.left.borrow())
+                        .ok_or_else(|| anyhow!("Persisted left-child digest is missing"))?;
+                    let right_digest = Self::cached_label(&internal.right.borrow())
+                        .ok_or_else(|| anyhow!("Persisted right-child digest is missing"))?;
+                    let (_, left) = Self::validate_reachable_node(
+                        lookup,
+                        tree,
+                        &left_digest,
+                        depth
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow!("Persisted AVL depth overflow"))?,
+                        active_path,
+                    )?;
+                    let (_, right) = Self::validate_reachable_node(
+                        lookup,
+                        tree,
+                        &right_digest,
+                        depth
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow!("Persisted AVL depth overflow"))?,
+                        active_path,
+                    )?;
+
+                    ensure!(
+                        separator == right.min_key,
+                        "Persisted AVL separator does not equal the minimum key of its right subtree"
+                    );
+                    ensure!(
+                        left.last_next_key == right.min_key,
+                        "Persisted AVL leaf next-key chain is not contiguous"
+                    );
+                    ensure!(
+                        left.max_key < right.min_key,
+                        "Persisted AVL subtree keys are not strictly ordered"
+                    );
+                    let expected_balance = if right.height == left.height {
+                        0
+                    } else if right.height
+                        == left
+                            .height
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow!("Persisted AVL subtree height overflow"))?
+                    {
+                        1
+                    } else if left.height
+                        == right
+                            .height
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow!("Persisted AVL subtree height overflow"))?
+                    {
+                        -1
+                    } else {
+                        return Err(anyhow!(
+                            "Persisted AVL subtree heights violate the balance bound"
+                        ));
+                    };
+                    ensure!(
+                        internal.balance == expected_balance,
+                        "Persisted AVL balance does not match subtree heights"
+                    );
+                    let height = core::cmp::max(left.height, right.height)
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("Persisted AVL subtree height overflow"))?;
+                    ensure!(
+                        height <= u8::MAX as usize,
+                        "Persisted AVL height exceeds digest encoding"
+                    );
+                    ValidatedSubtree {
+                        min_key: left.min_key,
+                        max_key: right.max_key,
+                        last_next_key: right.last_next_key,
+                        height,
+                    }
+                }
+            };
+            Ok((node, summary))
+        })();
+
+        active_path.remove(expected_digest);
+        result
+    }
+
+    fn validate_and_load_snapshot(
+        lookup: &dyn Fn(&[u8]) -> Result<Option<Vec<u8>>>,
+        version: &[u8],
+        key_length: usize,
+        value_length: Option<usize>,
+        validation_resolver: Resolver,
+    ) -> Result<(NodeId, usize)> {
+        ensure!(
+            version.len() == 33,
+            "Target AVL version must be exactly 33 bytes"
+        );
+        let root_hash = lookup(TOP_NODE_HASH_KEY)?
+            .ok_or_else(|| anyhow!("Root hash not found in rollback target"))?;
+        let root_digest: Digest32 = root_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Persisted root hash must be exactly 32 bytes"))?;
+
+        let height_bytes = lookup(TOP_NODE_HEIGHT_KEY)?
+            .ok_or_else(|| anyhow!("Height not found in rollback target"))?;
+        let encoded_height: [u8; 8] = height_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Persisted height must be exactly 8 bytes"))?;
+        let height_u64 = u64::from_le_bytes(encoded_height);
+        ensure!(
+            height_u64 <= u8::MAX as u64,
+            "Persisted AVL height exceeds digest encoding"
+        );
+        let height = usize::try_from(height_u64)
+            .map_err(|_| anyhow!("Persisted AVL height exceeds platform usize"))?;
+        ensure!(
+            version[..32] == root_digest && version[32] == height_u64 as u8,
+            "Target AVL version does not match persisted root metadata"
+        );
+
+        let tree = AVLTree::with_resolver(validation_resolver, key_length, value_length);
+        let (root, summary) =
+            Self::validate_reachable_node(lookup, &tree, &root_digest, 0, &mut BTreeSet::new())?;
+        ensure!(
+            summary.min_key == tree.negative_infinity_key(),
+            "Persisted AVL tree is missing its negative-infinity sentinel"
+        );
+        ensure!(
+            summary.last_next_key == tree.positive_infinity_key(),
+            "Persisted AVL tree is missing its positive-infinity sentinel"
+        );
+        ensure!(
+            summary.height == height,
+            "Computed AVL height does not match persisted metadata"
+        );
+        Ok((root, height))
+    }
+
     /// Create a new persistent AVL storage at the given path.
     pub fn open(path: &Path, key_length: usize, value_length: Option<usize>) -> Result<Self> {
+        ensure!(key_length > 0, "AVL key length must be greater than zero");
         let store = RedbVersionedStore::open(path)?;
+        if let Some(version) = store.last_version_id()? {
+            store.rollback_with_validation(&version, |lookup| {
+                Self::validate_and_load_snapshot(
+                    lookup,
+                    &version,
+                    key_length,
+                    value_length,
+                    Arc::new(|digest| Node::LabelOnly(NodeHeader::new(Some(*digest), None))),
+                )
+            })?;
+        }
         Ok(RedbAVLStorage {
             store: Arc::new(store),
             key_length,
@@ -272,45 +475,16 @@ impl VersionedAVLStorage for RedbAVLStorage {
     }
 
     fn rollback(&mut self, version: &ADDigest) -> Result<(NodeId, usize)> {
-        ensure!(
-            version.len() == 33,
-            "Target AVL version must be exactly 33 bytes"
-        );
-        let resolver = self.create_resolver();
         let key_length = self.key_length;
         let value_length = self.value_length;
         self.store.rollback_with_validation(version, |lookup| {
-            let root_hash = lookup(TOP_NODE_HASH_KEY)?
-                .ok_or_else(|| anyhow!("Root hash not found in rollback target"))?;
-            let root_digest: Digest32 = root_hash
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow!("Persisted root hash must be exactly 32 bytes"))?;
-
-            let height_bytes = lookup(TOP_NODE_HEIGHT_KEY)?
-                .ok_or_else(|| anyhow!("Height not found in rollback target"))?;
-            let encoded_height: [u8; 8] = height_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow!("Persisted height must be exactly 8 bytes"))?;
-            let height_u64 = u64::from_le_bytes(encoded_height);
-            ensure!(
-                height_u64 <= u8::MAX as u64,
-                "Persisted AVL height exceeds digest encoding"
-            );
-            let height = usize::try_from(height_u64)
-                .map_err(|_| anyhow!("Persisted AVL height exceeds platform usize"))?;
-            ensure!(
-                version[..32] == root_digest && version[32] == height_u64 as u8,
-                "Target AVL version does not match persisted root metadata"
-            );
-
-            let root_data = lookup(&root_digest)?
-                .ok_or_else(|| anyhow!("Root node data not found in rollback target"))?;
-            let root_bytes = Bytes::from(root_data);
-            let tree = AVLTree::with_resolver(resolver, key_length, value_length);
-            let root_node = Self::unpack_verified_node(&tree, &root_bytes, &root_digest)?;
-            Ok((root_node, height))
+            Self::validate_and_load_snapshot(
+                lookup,
+                version,
+                key_length,
+                value_length,
+                Arc::new(|digest| Node::LabelOnly(NodeHeader::new(Some(*digest), None))),
+            )
         })
     }
 
@@ -361,6 +535,369 @@ mod tests {
         (tree, bytes, digest)
     }
 
+    fn persist_root(storage: &mut RedbAVLStorage, root: NodeId, height: usize) -> ADDigest {
+        let mut tree = AVLTree::new(dummy_resolver, 32, None);
+        tree.root = Some(root);
+        tree.height = height;
+        let mut prover = BatchAVLProver::new(tree, true);
+        storage.update(&mut prover, vec![]).unwrap();
+        prover.digest().unwrap()
+    }
+
+    fn repeated_key(byte: u8) -> Bytes {
+        Bytes::from(vec![byte; 32])
+    }
+
+    fn two_leaf_root(
+        separator: Bytes,
+        left_next: Bytes,
+        balance: Balance,
+    ) -> (NodeId, Digest32, Digest32) {
+        let left = LeafNode::new(&repeated_key(0), &Bytes::new(), &left_next);
+        let right = LeafNode::new(&repeated_key(1), &Bytes::from("right"), &repeated_key(0xFF));
+        let left_digest = left.borrow_mut().label();
+        let right_digest = right.borrow_mut().label();
+        (
+            InternalNode::new(Some(separator), &left, &right, balance),
+            left_digest,
+            right_digest,
+        )
+    }
+
+    fn assert_authentic_record(storage: &RedbAVLStorage, digest: &Digest32) {
+        let data = storage.store.get_node(digest).unwrap().unwrap();
+        let bytes = Bytes::from(data);
+        let tree = AVLTree::new(dummy_resolver, 32, None);
+        RedbAVLStorage::validate_packed_node(&bytes, 32, None).unwrap();
+        RedbAVLStorage::unpack_verified_node(&tree, &bytes, digest).unwrap();
+    }
+
+    fn assert_target_rollback_error_is_atomic(
+        storage: &mut RedbAVLStorage,
+        target: &ADDigest,
+        expected_error: &str,
+    ) {
+        let tip = [0xA5u8; 33];
+        storage
+            .store
+            .update(&tip, &[(b"after-target", b"still-current")], &[])
+            .unwrap();
+        let root_before = storage.store.get_node(TOP_NODE_HASH_KEY).unwrap();
+        let height_before = storage.store.get_node(TOP_NODE_HEIGHT_KEY).unwrap();
+        let versions_before = storage.store.rollback_versions().unwrap();
+
+        let error = storage.rollback(target).unwrap_err();
+
+        assert!(
+            error.to_string().contains(expected_error),
+            "unexpected rollback error: {error:#}"
+        );
+        assert_eq!(storage.store.last_version_id().unwrap(), Some(tip.to_vec()));
+        assert_eq!(storage.store.rollback_versions().unwrap(), versions_before);
+        assert_eq!(
+            storage.store.get_node(b"after-target").unwrap(),
+            Some(b"still-current".to_vec())
+        );
+        assert_eq!(
+            storage.store.get_node(TOP_NODE_HASH_KEY).unwrap(),
+            root_before
+        );
+        assert_eq!(
+            storage.store.get_node(TOP_NODE_HEIGHT_KEY).unwrap(),
+            height_before
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_a_missing_reachable_descendant_atomically() {
+        let dir = tempdir().unwrap();
+        let mut storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        let negative_key = Bytes::from(vec![0u8; 32]);
+        let positive_key = Bytes::from(vec![0xFFu8; 32]);
+        let right_key = Bytes::from(vec![1u8; 32]);
+        let missing_left = LeafNode::new(&negative_key, &Bytes::new(), &right_key);
+        let missing_digest = missing_left.borrow_mut().label();
+        let right = LeafNode::new(&right_key, &Bytes::from("right"), &positive_key);
+        let root = InternalNode::new(
+            Some(right_key),
+            &Node::new_label(&missing_digest),
+            &right,
+            0,
+        );
+        let target = persist_root(&mut storage, root, 1);
+
+        assert_target_rollback_error_is_atomic(
+            &mut storage,
+            &target,
+            "Reachable AVL node is missing",
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_a_truncated_reachable_descendant_atomically() {
+        let dir = tempdir().unwrap();
+        let mut storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        let (root, left_digest, _) = two_leaf_root(repeated_key(1), repeated_key(1), 0);
+        let target = persist_root(&mut storage, root, 1);
+        storage
+            .store
+            .replace_node_for_test(&left_digest, &[1, 0, 0])
+            .unwrap();
+
+        assert_target_rollback_error_is_atomic(&mut storage, &target, "Persisted leaf");
+    }
+
+    #[test]
+    fn rollback_rejects_a_reachable_descendant_with_the_wrong_digest_atomically() {
+        let dir = tempdir().unwrap();
+        let mut storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        let (root, left_digest, _) = two_leaf_root(repeated_key(1), repeated_key(1), 0);
+        let target = persist_root(&mut storage, root, 1);
+        let replacement = LeafNode::new(
+            &repeated_key(2),
+            &Bytes::from("replacement"),
+            &repeated_key(3),
+        );
+        let replacement_digest = replacement.borrow_mut().label();
+        assert_ne!(replacement_digest, left_digest);
+        let tree = AVLTree::new(dummy_resolver, 32, None);
+        let replacement_bytes = tree.pack(replacement);
+        RedbAVLStorage::validate_packed_node(&replacement_bytes, 32, None).unwrap();
+        storage
+            .store
+            .replace_node_for_test(&left_digest, &replacement_bytes)
+            .unwrap();
+
+        assert_target_rollback_error_is_atomic(
+            &mut storage,
+            &target,
+            "Persisted node digest does not match its content-address key",
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_an_unhashed_separator_mutation_atomically() {
+        let dir = tempdir().unwrap();
+        let mut storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        let (root, _, _) = two_leaf_root(repeated_key(1), repeated_key(1), 0);
+        let target = persist_root(&mut storage, root, 1);
+        let root_digest: Digest32 = target[..32].try_into().unwrap();
+        let mut root_bytes = storage.store.get_node(&root_digest).unwrap().unwrap();
+        root_bytes[2..34].copy_from_slice(&repeated_key(2));
+        storage
+            .store
+            .replace_node_for_test(&root_digest, &root_bytes)
+            .unwrap();
+        assert_authentic_record(&storage, &root_digest);
+
+        assert_target_rollback_error_is_atomic(
+            &mut storage,
+            &target,
+            "separator does not equal the minimum key of its right subtree",
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_a_rehashed_broken_leaf_next_chain_atomically() {
+        let dir = tempdir().unwrap();
+        let mut storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        let (root, left_digest, right_digest) = two_leaf_root(repeated_key(1), repeated_key(2), 0);
+        let target = persist_root(&mut storage, root, 1);
+        let root_digest: Digest32 = target[..32].try_into().unwrap();
+        for digest in [root_digest, left_digest, right_digest] {
+            assert_authentic_record(&storage, &digest);
+        }
+
+        assert_target_rollback_error_is_atomic(
+            &mut storage,
+            &target,
+            "leaf next-key chain is not contiguous",
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_a_rehashed_wrong_balance_atomically() {
+        let dir = tempdir().unwrap();
+        let mut storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        let (root, left_digest, right_digest) = two_leaf_root(repeated_key(1), repeated_key(1), 1);
+        let target = persist_root(&mut storage, root, 1);
+        let root_digest: Digest32 = target[..32].try_into().unwrap();
+        for digest in [root_digest, left_digest, right_digest] {
+            assert_authentic_record(&storage, &digest);
+        }
+
+        assert_target_rollback_error_is_atomic(
+            &mut storage,
+            &target,
+            "Persisted AVL balance does not match subtree heights",
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_a_wrong_committed_tree_height_atomically() {
+        let dir = tempdir().unwrap();
+        let mut storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        let (root, left_digest, right_digest) = two_leaf_root(repeated_key(1), repeated_key(1), 0);
+        let target = persist_root(&mut storage, root, 2);
+        let root_digest: Digest32 = target[..32].try_into().unwrap();
+        for digest in [root_digest, left_digest, right_digest] {
+            assert_authentic_record(&storage, &digest);
+        }
+
+        assert_target_rollback_error_is_atomic(
+            &mut storage,
+            &target,
+            "Computed AVL height does not match persisted metadata",
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_a_tree_without_the_negative_infinity_sentinel_atomically() {
+        let dir = tempdir().unwrap();
+        let mut storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        let left = LeafNode::new(&repeated_key(1), &Bytes::from("left"), &repeated_key(2));
+        let right = LeafNode::new(&repeated_key(2), &Bytes::from("right"), &repeated_key(0xFF));
+        let root = InternalNode::new(Some(repeated_key(2)), &left, &right, 0);
+        let target = persist_root(&mut storage, root, 1);
+        for digest in [
+            <Digest32>::try_from(&target[..32]).unwrap(),
+            left.borrow_mut().label(),
+            right.borrow_mut().label(),
+        ] {
+            assert_authentic_record(&storage, &digest);
+        }
+
+        assert_target_rollback_error_is_atomic(
+            &mut storage,
+            &target,
+            "missing its negative-infinity sentinel",
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_a_tree_without_the_positive_infinity_sentinel_atomically() {
+        let dir = tempdir().unwrap();
+        let mut storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        let left = LeafNode::new(&repeated_key(0), &Bytes::new(), &repeated_key(1));
+        let right = LeafNode::new(&repeated_key(1), &Bytes::from("right"), &repeated_key(0xFE));
+        let root = InternalNode::new(Some(repeated_key(1)), &left, &right, 0);
+        let target = persist_root(&mut storage, root, 1);
+        for digest in [
+            <Digest32>::try_from(&target[..32]).unwrap(),
+            left.borrow_mut().label(),
+            right.borrow_mut().label(),
+        ] {
+            assert_authentic_record(&storage, &digest);
+        }
+
+        assert_target_rollback_error_is_atomic(
+            &mut storage,
+            &target,
+            "missing its positive-infinity sentinel",
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_a_leaf_key_that_does_not_precede_its_next_key_atomically() {
+        let dir = tempdir().unwrap();
+        let mut storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        let invalid_leaf = LeafNode::new(&repeated_key(0), &Bytes::new(), &repeated_key(0));
+        let digest = invalid_leaf.borrow_mut().label();
+        let target = persist_root(&mut storage, invalid_leaf, 0);
+        assert_authentic_record(&storage, &digest);
+
+        assert_target_rollback_error_is_atomic(
+            &mut storage,
+            &target,
+            "leaf key must precede its next key",
+        );
+    }
+
+    #[test]
+    fn open_rejects_a_corrupt_reachable_avl_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        let mut storage = RedbAVLStorage::open(&path, 32, None).unwrap();
+        let (root, left_digest, _) = two_leaf_root(repeated_key(1), repeated_key(1), 0);
+        persist_root(&mut storage, root, 1);
+        storage
+            .store
+            .replace_node_for_test(&left_digest, &[1, 0, 0])
+            .unwrap();
+        drop(storage);
+
+        let reopened = RedbAVLStorage::open(&path, 32, None);
+
+        assert!(reopened.is_err(), "startup must reject corrupt AVL closure");
+    }
+
+    #[test]
+    fn rollback_returns_a_lazy_multilevel_root_after_full_validation() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let dir = tempdir().unwrap();
+        let mut storage = RedbAVLStorage::open(&dir.path().join("test.redb"), 32, None).unwrap();
+        let tree = AVLTree::new(dummy_resolver, 32, None);
+        let mut prover = BatchAVLProver::new(tree, true);
+        storage.update(&mut prover, vec![]).unwrap();
+        for byte in 1..=16u8 {
+            prover
+                .perform_one_operation(&Operation::Insert(KeyValue {
+                    key: repeated_key(byte),
+                    value: Bytes::from(vec![byte]),
+                }))
+                .unwrap();
+        }
+        storage.update(&mut prover, vec![]).unwrap();
+        let target = prover.digest().unwrap();
+
+        let validation_resolver_calls = Arc::new(AtomicUsize::new(0));
+        let validation_calls = Arc::clone(&validation_resolver_calls);
+        let validation_resolver: Resolver = Arc::new(move |digest| {
+            validation_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Node::LabelOnly(NodeHeader::new(Some(*digest), None))
+        });
+        let (root, height) = storage
+            .store
+            .rollback_with_validation(&target, |lookup| {
+                RedbAVLStorage::validate_and_load_snapshot(
+                    lookup,
+                    &target,
+                    32,
+                    None,
+                    validation_resolver,
+                )
+            })
+            .unwrap();
+        assert_eq!(validation_resolver_calls.load(AtomicOrdering::SeqCst), 0);
+
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&resolver_calls);
+        let persistent_resolver = storage.create_resolver();
+        let counting_resolver: Resolver = Arc::new(move |digest| {
+            calls.fetch_add(1, AtomicOrdering::SeqCst);
+            persistent_resolver(digest)
+        });
+        assert_eq!(resolver_calls.load(AtomicOrdering::SeqCst), 0);
+        match &*root.borrow() {
+            Node::Internal(internal) => {
+                assert!(matches!(&*internal.left.borrow(), Node::LabelOnly(_)));
+                assert!(matches!(&*internal.right.borrow(), Node::LabelOnly(_)));
+            }
+            _ => panic!("multi-level persisted root must be internal"),
+        }
+
+        let mut restored_tree = AVLTree::with_resolver(counting_resolver, 32, None);
+        restored_tree.root = Some(root);
+        restored_tree.height = height;
+        let restored = BatchAVLProver::new(restored_tree, true);
+        assert_eq!(
+            restored.unauthenticated_lookup(&repeated_key(8)),
+            Some(Bytes::from(vec![8u8]))
+        );
+        assert!(resolver_calls.load(AtomicOrdering::SeqCst) > 0);
+    }
+
     #[test]
     fn fresh_unlabelled_node_has_no_persisted_removal_key() {
         let key = Bytes::from(vec![1u8; 32]);
@@ -369,6 +906,21 @@ mod tests {
         let leaf = LeafNode::new(&key, &value, &next_key);
 
         assert_eq!(RedbAVLStorage::cached_label(&leaf.borrow()), None);
+    }
+
+    #[test]
+    fn open_rejects_zero_length_avl_keys() {
+        let dir = tempdir().unwrap();
+
+        let error = match RedbAVLStorage::open(&dir.path().join("test.redb"), 0, None) {
+            Ok(_) => panic!("zero-length AVL keys must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "AVL key length must be greater than zero"
+        );
     }
 
     #[test]

@@ -168,6 +168,14 @@ persistent.storage.flush().unwrap();
 
 > **⚠️ Critical ordering rule:** Raw `RedbAVLStorage` users must call `update()` before `generate_proof()` because proof generation clears the changed-node buffers; `PersistentBatchAVLProver::generate_proof_and_update_storage` enforces that order.
 
+> **Version recurrence:** The current persistence schema uses the 33-byte AVL
+> digest as the version ID. A proof-only update at the current tip is coalesced
+> after exact state verification, but a later `D0 -> D1 -> D0` transition is
+> rejected atomically because `D0` is already a retained, non-tip version.
+> Persistence never interprets digest recurrence as an automatic rollback:
+> callers must explicitly roll back to the retained version. Supporting distinct
+> later occurrences of the same digest requires future explicit occurrence IDs.
+
 ### Future Work
 
 - **Log compaction:** A `compact(keep_versions: u32)` method to prune undo-log entries beyond a retention window, preventing unbounded DB growth on long-running nodes.

@@ -5,6 +5,7 @@ use blake2::digest::Digest;
 use blake2::Blake2b;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use core::cell::RefCell;
+use core::mem;
 //use debug_cell::RefCell;
 use alloc::rc::Rc;
 use core::cmp::Ordering;
@@ -274,6 +275,25 @@ impl NodeHeader {
 }
 
 impl InternalNode {
+    fn children_are_terminal_for_drop(&self) -> bool {
+        self.left
+            .try_borrow()
+            .map(|node| !matches!(&*node, Node::Internal(_)))
+            .unwrap_or(false)
+            && self
+                .right
+                .try_borrow()
+                .map(|node| !matches!(&*node, Node::Internal(_)))
+                .unwrap_or(false)
+    }
+
+    fn detach_children_for_drop(&mut self) -> (NodeId, NodeId) {
+        let sentinel = Node::new_label(&Digest32::default());
+        let left = mem::replace(&mut self.left, sentinel.clone());
+        let right = mem::replace(&mut self.right, sentinel);
+        (left, right)
+    }
+
     pub fn new(key: Option<ADKey>, left: &NodeId, right: &NodeId, balance: Balance) -> NodeId {
         Rc::new(RefCell::new(Node::Internal(InternalNode {
             hdr: NodeHeader::new(None, key),
@@ -324,6 +344,48 @@ impl InternalNode {
             panic!("Not internal node");
         }
         node.clone()
+    }
+}
+
+impl Drop for InternalNode {
+    fn drop(&mut self) {
+        // Distinct shared children cannot become uniquely owned when this
+        // node releases its two edges, so recursive teardown cannot start
+        // here. If both fields alias the same allocation, however, releasing
+        // both edges may drop its strong count to zero.
+        if !Rc::ptr_eq(&self.left, &self.right)
+            && Rc::strong_count(&self.left) > 1
+            && Rc::strong_count(&self.right) > 1
+        {
+            return;
+        }
+
+        // A terminal pair can use ordinary Rc teardown. Avoiding a worklist
+        // here also keeps manually detached terminal nodes from allocating a
+        // nested worklist when they are dropped below.
+        if self.children_are_terminal_for_drop() {
+            return;
+        }
+
+        let (left, right) = self.detach_children_for_drop();
+        let mut pending = vec![left, right];
+        while let Some(edge) = pending.pop() {
+            match Rc::try_unwrap(edge) {
+                Ok(cell) => {
+                    let node = cell.into_inner();
+                    if let Node::Internal(mut internal) = node {
+                        if !internal.children_are_terminal_for_drop() {
+                            let (left, right) = internal.detach_children_for_drop();
+                            pending.push(left);
+                            pending.push(right);
+                        }
+                    }
+                }
+                // A shared allocation must be left untouched: only this edge
+                // is being released, and another owner controls its lifetime.
+                Err(shared) => drop(shared),
+            }
+        }
     }
 }
 

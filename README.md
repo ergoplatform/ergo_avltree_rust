@@ -114,8 +114,86 @@ Here are code examples for generating proofs and checking them. In this example 
   }
 ```
 
+## Compatibility notes
+
+- `Resolver` is now an `Arc<dyn Fn(&Digest32) -> Node + Send + Sync>`. Bare
+  closures and function pointers continue to use `AVLTree::new`; pre-built
+  `Resolver` values must use `AVLTree::with_resolver`.
+- `AuthenticatedTreeOpsBase` gained proof-cycle bookkeeping. Downstream struct
+  literals must use its constructor instead of naming every field directly.
+- `contains` now treats unresolved `LabelOnly` nodes conservatively as “maybe
+  present”, preventing unsafe deletion of persistent nodes.
+
+## Persistent Storage (Versioned Database)
+
+This crate provides an optional `redb`-backed persistent storage layer implementing the `VersionedAVLStorage` trait. It features an **undo-log architecture** for fast rollbacks and history navigation, mirroring the Scala `LDBVersionedStore`.
+
+The core crate is `#![no_std]`. To enable persistence, add the `persistence` feature:
+
+```toml
+[dependencies]
+ergo_avltree_rust = { version = "0.1", features = ["persistence"] }
+```
+
+### Architecture
+
+- **`RedbVersionedStore`** — Low-level versioned key-value store with 4 strictly-typed `redb` tables (`nodes`, `meta`, `undo_log`, `versions`). Each `update()` atomically records compensating undo entries; `rollback()` walks the version chain and applies them in reverse.
+- **`RedbAVLStorage`** — Implements `VersionedAVLStorage`. Bridges the AVL tree to the versioned store using the existing `pack()`/`unpack()` serialization. Provides a `Resolver` closure backed by the database for lazy node loading.
+- **Content-addressed node deduplication** — Unchanged nodes skip content writes; metadata and undo-log entries still record each persisted transition.
+- **Pure Rust** — No C/C++ dependencies (unlike RocksDB/LevelDB). Simplifies cross-compilation and future WASM integration.
+
+### Example
+
+```rust
+use std::path::Path;
+use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
+use ergo_avltree_rust::batch_node::*;
+use ergo_avltree_rust::operation::*;
+use ergo_avltree_rust::persistence::RedbAVLStorage;
+use ergo_avltree_rust::persistent_batch_avl_prover::PersistentBatchAVLProver;
+
+let storage = RedbAVLStorage::open(
+    Path::new("/path/to/avl_state.redb"),
+    32,
+    None,
+).unwrap();
+let tree = AVLTree::with_resolver(storage.create_resolver(), 32, None);
+let prover = BatchAVLProver::new(tree, true);
+let mut persistent = PersistentBatchAVLProver::new(
+    prover,
+    Box::new(storage),
+    vec![],
+).unwrap();
+
+let key = bytes::Bytes::from(vec![1u8; 32]);
+let value = bytes::Bytes::from("hello");
+persistent.perform_one_operation(&Operation::Insert(KeyValue {
+    key,
+    value,
+})).unwrap();
+
+let proof = persistent.generate_proof_and_update_storage(vec![]).unwrap();
+persistent.storage.flush().unwrap();
+```
+
+> **⚠️ Critical ordering rule:** Raw `RedbAVLStorage` users must call `update()` before `generate_proof()` because proof generation clears the changed-node buffers; `PersistentBatchAVLProver::generate_proof_and_update_storage` enforces that order.
+
+> **Version recurrence:** The current persistence schema uses the 33-byte AVL
+> digest as the version ID. A proof-only update at the current tip is coalesced
+> after exact state verification, but a later `D0 -> D1 -> D0` transition is
+> rejected atomically because `D0` is already a retained, non-tip version.
+> Persistence never interprets digest recurrence as an automatic rollback:
+> callers must explicitly roll back to the retained version. Supporting distinct
+> later occurrences of the same digest requires future explicit occurrence IDs.
+
+### Future Work
+
+- **Log compaction:** A `compact(keep_versions: u32)` method to prune undo-log entries beyond a retention window, preventing unbounded DB growth on long-running nodes.
+- **Explicit version IDs:** The current `VersionedAVLStorage` trait uses the tree digest as version ID. A future trait update could accept explicit block IDs for better empty-block handling.
+
 # Tests
 Run `cargo test` from a folder containing the framework to launch tests.
+With persistence: `cargo test --features persistence`
 
 # License
 

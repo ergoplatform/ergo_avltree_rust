@@ -19,7 +19,7 @@ impl PersistentBatchAVLProver {
         additional_data: Vec<(ADKey, ADValue)>,
     ) -> Result<PersistentBatchAVLProver> {
         let mut this = PersistentBatchAVLProver { prover, storage };
-        match this.storage.version() {
+        match this.storage.try_version()? {
             Some(ver) => {
                 let _ = this.rollback(&ver)?;
             }
@@ -27,7 +27,10 @@ impl PersistentBatchAVLProver {
                 let _ = this.generate_proof_and_update_storage(additional_data)?;
             }
         }
-        ensure!(this.storage.version().unwrap() == this.digest());
+        ensure!(
+            this.storage.try_version()? == Some(this.digest()),
+            "Persistent storage version does not match prover digest"
+        );
         Ok(this)
     }
 
@@ -59,10 +62,15 @@ impl PersistentBatchAVLProver {
         Ok(self.prover.generate_proof())
     }
 
+    /// Rewind to a stored version, abandoning any in-flight proof cycle.
+    ///
+    /// Delegates to [`BatchAVLProver::restore_root`] rather than re-installing
+    /// the root by hand: both are the same rewind, and the hand-rolled copy
+    /// kept drifting behind it — first missing the `old_top_node` rebase, then
+    /// the `modified_nodes` clear. One implementation cannot drift from itself.
     pub fn rollback(&mut self, version: &ADDigest) -> Result<()> {
         let (root, height) = self.storage.rollback(version)?;
-        self.prover.base.tree.root = Some(root);
-        self.prover.base.tree.height = height;
+        self.prover.restore_root(root, height);
         Ok(())
     }
 }

@@ -1,4 +1,5 @@
 use crate::operation::*;
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 use blake2::digest::Digest;
@@ -18,7 +19,7 @@ pub(crate) const END_OF_TREE_IN_PACKAGED_PROOF: u8 = 4;
 pub type Balance = i8;
 pub type SerializedAdProof = Bytes;
 pub type NodeId = Rc<RefCell<Node>>;
-pub type Resolver = fn(&Digest32) -> Node;
+pub type Resolver = alloc::sync::Arc<dyn Fn(&Digest32) -> Node + Send + Sync>;
 pub type Blake2b256 = Blake2b<blake2::digest::typenum::U32>;
 
 #[derive(Debug, Clone)]
@@ -371,7 +372,34 @@ pub struct AVLTree {
 }
 
 impl AVLTree {
-    pub fn new(resolver: Resolver, key_length: usize, value_length: Option<usize>) -> AVLTree {
+    /// Accepts any closure (wrapped into the `Arc` internally). The `impl Fn` bound lets
+    /// callers pass a bare, unannotated closure (e.g. `|digest| …`) and have its parameter
+    /// type inferred — the shape every closure caller (the interpreter) relies on.
+    /// To pass a pre-built [`Resolver`] (`Arc<dyn Fn>`), use [`AVLTree::with_resolver`].
+    pub fn new(
+        resolver: impl Fn(&Digest32) -> Node + Send + Sync + 'static,
+        key_length: usize,
+        value_length: Option<usize>,
+    ) -> AVLTree {
+        AVLTree {
+            key_length,
+            value_length,
+            resolver: alloc::sync::Arc::new(resolver),
+            height: 0,
+            root: None,
+        }
+    }
+
+    /// Construct from a pre-built [`Resolver`] (an `Arc<dyn Fn(&Digest32) -> Node + …>`),
+    /// e.g. a persistence backend's node loader that captures a DB handle. Passed through
+    /// without re-wrapping. Closure callers use [`AVLTree::new`] instead — a single
+    /// `impl Fn` constructor cannot also accept an `Arc<dyn Fn>` (it isn't `Fn`), and an
+    /// `impl IntoResolver`-style bound would break unannotated closures (E0282).
+    pub fn with_resolver(
+        resolver: Resolver,
+        key_length: usize,
+        value_length: Option<usize>,
+    ) -> AVLTree {
         AVLTree {
             key_length,
             value_length,
@@ -379,6 +407,72 @@ impl AVLTree {
             height: 0,
             root: None,
         }
+    }
+
+    /// Clone the tree structure into distinct `Rc<RefCell<_>>` nodes while
+    /// wrapping the resolver to detach every lazy-loaded graph too. Preview
+    /// provers must not share mutable node flags with the persistence cycle
+    /// they preview or with resolver-owned node caches.
+    pub(crate) fn clone_with_independent_nodes(
+        &self,
+        old_root: &Option<NodeId>,
+        modified_nodes: &[NodeId],
+    ) -> (AVLTree, Option<NodeId>, BTreeMap<usize, NodeId>) {
+        let resolver = self.resolver.clone();
+        let preview_resolver: Resolver = alloc::sync::Arc::new(move |digest| {
+            let resolved = resolver(digest);
+            let mut nodes = BTreeMap::new();
+            let detached = AVLTree::clone_node_value(&resolved, &mut nodes);
+            let preview_node = detached.borrow().clone();
+            preview_node
+        });
+        let mut nodes = BTreeMap::new();
+        let root = self
+            .root
+            .as_ref()
+            .map(|node| Self::clone_node(node, &mut nodes));
+        let old_root = old_root
+            .as_ref()
+            .map(|node| Self::clone_node(node, &mut nodes));
+        for node in modified_nodes {
+            Self::clone_node(node, &mut nodes);
+        }
+        (
+            AVLTree {
+                root,
+                height: self.height,
+                key_length: self.key_length,
+                value_length: self.value_length,
+                resolver: preview_resolver,
+            },
+            old_root,
+            nodes,
+        )
+    }
+
+    fn clone_node(node: &NodeId, nodes: &mut BTreeMap<usize, NodeId>) -> NodeId {
+        let address = Rc::as_ptr(node) as usize;
+        if let Some(cloned) = nodes.get(&address) {
+            return cloned.clone();
+        }
+        let node_value = node.borrow().clone();
+        let cloned = Self::clone_node_value(&node_value, nodes);
+        nodes.insert(address, cloned.clone());
+        cloned
+    }
+
+    fn clone_node_value(node: &Node, nodes: &mut BTreeMap<usize, NodeId>) -> NodeId {
+        let cloned = match node {
+            Node::LabelOnly(header) => Node::LabelOnly(header.clone()),
+            Node::Leaf(leaf) => Node::Leaf(leaf.clone()),
+            Node::Internal(internal) => Node::Internal(InternalNode {
+                hdr: internal.hdr.clone(),
+                balance: internal.balance,
+                left: Self::clone_node(&internal.left, nodes),
+                right: Self::clone_node(&internal.right, nodes),
+            }),
+        };
+        Rc::new(RefCell::new(cloned))
     }
 
     pub fn left(&self, node: &NodeId) -> NodeId {
@@ -513,30 +607,68 @@ impl AVLTree {
         key_found: bool,
     ) -> bool {
         if &self.label(node) == label {
-            true
-        } else {
-            if let Node::Internal(r) = &mut *node.borrow_mut() {
-                if key_found {
-                    self.contains_recursive(&self.resolve(&mut r.left), key, label, true)
-                } else {
-                    match (*key).cmp(r.hdr.key.as_ref().unwrap()) {
-                        Ordering::Equal =>
-                        // found in the tree -- go one step right, then left to the leaf
-                        {
-                            self.contains_recursive(&self.resolve(&mut r.right), key, label, true)
-                        }
-                        Ordering::Less =>
-                        // going left, not yet found
-                        {
-                            self.contains_recursive(&self.resolve(&mut r.left), key, label, false)
-                        }
-                        Ordering::Greater => {
-                            self.contains_recursive(&self.resolve(&mut r.right), key, label, false)
+            return true;
+        }
+
+        // Discriminate the node kind in a scoped immutable borrow so we can
+        // re-borrow mutably below for the Internal walk without a conflict.
+        enum Kind {
+            Internal,
+            Leaf,
+            LabelOnly,
+        }
+        let kind = {
+            let n = node.borrow();
+            match &*n {
+                Node::Internal(_) => Kind::Internal,
+                Node::Leaf(_) => Kind::Leaf,
+                Node::LabelOnly(_) => Kind::LabelOnly,
+            }
+        };
+
+        match kind {
+            Kind::Leaf => false,
+            // Reached a LabelOnly that the resolver could not materialize
+            // (digest not in storage). We cannot conclude whether the target
+            // label is present in the unresolved subtree, so fail safe by
+            // returning true. Used by `removed_nodes()` to decide what to
+            // delete from storage; treating an unresolvable subtree as
+            // "definitely absent" silently deletes nodes that may still be
+            // referenced from this subtree, producing dangling parent->child
+            // references on disk and later walks bailing with
+            // "should never reach this point".
+            Kind::LabelOnly => true,
+            Kind::Internal => {
+                if let Node::Internal(r) = &mut *node.borrow_mut() {
+                    if key_found {
+                        self.contains_recursive(&self.resolve(&mut r.left), key, label, true)
+                    } else {
+                        match (*key).cmp(r.hdr.key.as_ref().unwrap()) {
+                            // found in the tree -- go one step right, then left to the leaf
+                            Ordering::Equal => self.contains_recursive(
+                                &self.resolve(&mut r.right),
+                                key,
+                                label,
+                                true,
+                            ),
+                            // going left, not yet found
+                            Ordering::Less => self.contains_recursive(
+                                &self.resolve(&mut r.left),
+                                key,
+                                label,
+                                false,
+                            ),
+                            Ordering::Greater => self.contains_recursive(
+                                &self.resolve(&mut r.right),
+                                key,
+                                label,
+                                false,
+                            ),
                         }
                     }
+                } else {
+                    unreachable!("kind already verified Internal")
                 }
-            } else {
-                false
             }
         }
     }
@@ -665,5 +797,38 @@ impl fmt::Display for AVLTree {
         } else {
             writeln!(f, "Empty tree")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::sync::Arc;
+
+    // `new` must accept a bare, UNANNOTATED closure with its parameter type inferred —
+    // the exact shape the interpreter uses at its 13 `AVLTree::new` sites. This only
+    // works because the bound is literally `Fn(&Digest32) -> Node`; an `impl IntoResolver`
+    // (non-`Fn`) bound made this fail with E0282, which is why `new` stays `impl Fn`.
+    #[test]
+    fn new_accepts_unannotated_closure() {
+        let _ = AVLTree::new(
+            |digest| Node::LabelOnly(NodeHeader::new(Some(*digest), None)),
+            32,
+            None,
+        );
+    }
+
+    // `with_resolver` takes a pre-built `Arc<dyn Fn>` Resolver (the node's storage-backend
+    // shape) and stores it WITHOUT re-wrapping — `Arc<dyn Fn>` isn't `Fn`, so it can't go
+    // through `new`'s `impl Fn` bound.
+    #[test]
+    fn with_resolver_stores_prebuilt_arc_without_rewrapping() {
+        let resolver: Resolver =
+            Arc::new(|digest: &Digest32| Node::LabelOnly(NodeHeader::new(Some(*digest), None)));
+        let tree = AVLTree::with_resolver(resolver.clone(), 32, None);
+        assert!(
+            Arc::ptr_eq(&tree.resolver, &resolver),
+            "with_resolver must store the pre-built Resolver without re-wrapping"
+        );
     }
 }

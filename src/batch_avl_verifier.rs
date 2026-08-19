@@ -37,6 +37,24 @@ pub struct BatchAVLVerifier {
     replay_index: usize,
 }
 
+/// Read `n` bytes from `proof` starting at `*i`, advancing `*i` past them.
+///
+/// Returns an error (rather than panicking with a slice-bounds or overflow
+/// panic) when the proof is too short or the requested length overflows. A
+/// malformed, truncated, or empty proof must fail gracefully: the reference
+/// `BatchAVLVerifier` reconstructs the tree inside a `Try`, so any failure
+/// there simply yields a verifier with no tree rather than crashing.
+fn read_proof_slice<'a>(proof: &'a [u8], i: &mut usize, n: usize) -> Result<&'a [u8]> {
+    let end = i
+        .checked_add(n)
+        .ok_or_else(|| anyhow!("Malformed AVL proof: length overflow"))?;
+    let slice = proof
+        .get(*i..end)
+        .ok_or_else(|| anyhow!("Malformed AVL proof: unexpected end of input"))?;
+    *i = end;
+    Ok(slice)
+}
+
 impl BatchAVLVerifier {
     pub fn new(
         starting_digest: &ADDigest,
@@ -97,7 +115,12 @@ impl BatchAVLVerifier {
         let mut previous_leaf: Option<NodeId> = None;
         let mut stack: Vec<NodeId> = Vec::new();
         let key_length = self.base.tree.key_length;
-        while self.proof[i] != END_OF_TREE_IN_PACKAGED_PROOF {
+        while *self
+            .proof
+            .get(i)
+            .ok_or_else(|| anyhow!("Malformed AVL proof: unexpected end of input"))?
+            != END_OF_TREE_IN_PACKAGED_PROOF
+        {
             let n = self.proof[i];
             i += 1;
             num_nodes += 1;
@@ -105,8 +128,7 @@ impl BatchAVLVerifier {
             match n {
                 LABEL_IN_PACKAGED_PROOF => {
                     let mut label: Digest32 = Default::default();
-                    label.copy_from_slice(&self.proof[i..i + DIGEST_LENGTH]);
-                    i += DIGEST_LENGTH;
+                    label.copy_from_slice(read_proof_slice(&self.proof, &mut i, DIGEST_LENGTH)?);
                     stack.push(Node::new_label(&label));
                     previous_leaf = None;
                 }
@@ -114,31 +136,37 @@ impl BatchAVLVerifier {
                     let key = if let Some(prev) = previous_leaf {
                         Bytes::copy_from_slice(&self.base.tree.next_node_key(&prev))
                     } else {
-                        let start = i;
-                        i += self.base.tree.key_length;
-                        Bytes::copy_from_slice(&self.proof[start..i])
+                        Bytes::copy_from_slice(read_proof_slice(&self.proof, &mut i, key_length)?)
                     };
-                    let next_leaf_key = Bytes::copy_from_slice(&self.proof[i..i + key_length]);
-                    i += key_length;
-                    let value_length = self.base.tree.value_length.unwrap_or_else(|| {
-                        let vl = BigEndian::read_u32(&self.proof[i..i + 4]) as usize;
-                        i += 4;
-                        vl
-                    });
+                    let next_leaf_key =
+                        Bytes::copy_from_slice(read_proof_slice(&self.proof, &mut i, key_length)?);
+                    let value_length = match self.base.tree.value_length {
+                        Some(vl) => vl,
+                        None => {
+                            BigEndian::read_u32(read_proof_slice(&self.proof, &mut i, 4)?) as usize
+                        }
+                    };
                     ensure!(
                         value_length <= MAX_VALUE_LENGTH,
                         "value length {} exceeds maximum",
                         value_length
                     );
-                    let value = Bytes::copy_from_slice(&self.proof[i..i + value_length]);
-                    i += value_length;
+                    let value = Bytes::copy_from_slice(read_proof_slice(
+                        &self.proof,
+                        &mut i,
+                        value_length,
+                    )?);
                     let leaf = LeafNode::new(&key, &value, &next_leaf_key);
                     stack.push(leaf.clone());
                     previous_leaf = Some(leaf);
                 }
                 _ => {
-                    let right = stack.pop().unwrap();
-                    let left = stack.pop().unwrap();
+                    let right = stack
+                        .pop()
+                        .ok_or_else(|| anyhow!("Malformed AVL proof: stack underflow"))?;
+                    let left = stack
+                        .pop()
+                        .ok_or_else(|| anyhow!("Malformed AVL proof: stack underflow"))?;
                     stack.push(InternalNode::new(None, &left, &right, n as Balance));
                 }
             }

@@ -79,6 +79,12 @@ impl BatchAVLProver {
     /// @return - Success(Some(old value)), Success(None), or Failure
     ////
     pub fn perform_one_operation(&mut self, operation: &Operation) -> Result<Option<ADValue>> {
+        // Ensure root is resolved before performing operation
+        if let Some(mut root) = self.base.tree.root.take() {
+            self.base.tree.resolve(&mut root);
+            self.base.tree.root = Some(root);
+        }
+
         self.replay_index = self.directions_bit_length;
         let res = self.return_result_of_one_operation(operation, &self.top_node());
         if res.is_err() {
@@ -234,13 +240,16 @@ impl BatchAVLProver {
     /// @tparam LR - result of applying leafFn to a leaf. Result of all walk application
     /// @return
     ///
-    pub fn tree_walk<IR, LR>(
+    fn tree_walk<IR, LR>(
         &self,
         internal_node_fn: &mut dyn FnMut(&InternalNode, IR) -> (NodeId, IR),
         leaf_fn: &mut dyn FnMut(&LeafNode, IR) -> LR,
-        initial: IR,
+        initial_ir: IR,
     ) -> LR {
-        self.walk(&self.top_node(), initial, internal_node_fn, leaf_fn)
+        let mut root = self.top_node();
+        // Resolve root if needed (locally, since we can't modify the tree here)
+        self.base.tree.resolve(&mut root);
+        self.walk(&root, initial_ir, internal_node_fn, leaf_fn)
     }
 
     ///

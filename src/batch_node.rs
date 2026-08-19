@@ -18,7 +18,7 @@ pub(crate) const END_OF_TREE_IN_PACKAGED_PROOF: u8 = 4;
 pub type Balance = i8;
 pub type SerializedAdProof = Bytes;
 pub type NodeId = Rc<RefCell<Node>>;
-pub type Resolver = fn(&Digest32) -> Node;
+pub type Resolver = alloc::sync::Arc<dyn Fn(&Digest32) -> Node + Send + Sync>;
 pub type Blake2b256 = Blake2b<blake2::digest::typenum::U32>;
 
 #[derive(Debug, Clone)]
@@ -371,7 +371,34 @@ pub struct AVLTree {
 }
 
 impl AVLTree {
-    pub fn new(resolver: Resolver, key_length: usize, value_length: Option<usize>) -> AVLTree {
+    /// Accepts any closure (wrapped into the `Arc` internally). The `impl Fn` bound lets
+    /// callers pass a bare, unannotated closure (e.g. `|digest| …`) and have its parameter
+    /// type inferred — the shape every closure caller (the interpreter) relies on.
+    /// To pass a pre-built [`Resolver`] (`Arc<dyn Fn>`), use [`AVLTree::with_resolver`].
+    pub fn new(
+        resolver: impl Fn(&Digest32) -> Node + Send + Sync + 'static,
+        key_length: usize,
+        value_length: Option<usize>,
+    ) -> AVLTree {
+        AVLTree {
+            key_length,
+            value_length,
+            resolver: alloc::sync::Arc::new(resolver),
+            height: 0,
+            root: None,
+        }
+    }
+
+    /// Construct from a pre-built [`Resolver`] (an `Arc<dyn Fn(&Digest32) -> Node + …>`),
+    /// e.g. a persistence backend's node loader that captures a DB handle. Passed through
+    /// without re-wrapping. Closure callers use [`AVLTree::new`] instead — a single
+    /// `impl Fn` constructor cannot also accept an `Arc<dyn Fn>` (it isn't `Fn`), and an
+    /// `impl IntoResolver`-style bound would break unannotated closures (E0282).
+    pub fn with_resolver(
+        resolver: Resolver,
+        key_length: usize,
+        value_length: Option<usize>,
+    ) -> AVLTree {
         AVLTree {
             key_length,
             value_length,
@@ -665,5 +692,38 @@ impl fmt::Display for AVLTree {
         } else {
             writeln!(f, "Empty tree")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::sync::Arc;
+
+    // `new` must accept a bare, UNANNOTATED closure with its parameter type inferred —
+    // the exact shape the interpreter uses at its 13 `AVLTree::new` sites. This only
+    // works because the bound is literally `Fn(&Digest32) -> Node`; an `impl IntoResolver`
+    // (non-`Fn`) bound made this fail with E0282, which is why `new` stays `impl Fn`.
+    #[test]
+    fn new_accepts_unannotated_closure() {
+        let _ = AVLTree::new(
+            |digest| Node::LabelOnly(NodeHeader::new(Some(*digest), None)),
+            32,
+            None,
+        );
+    }
+
+    // `with_resolver` takes a pre-built `Arc<dyn Fn>` Resolver (the node's storage-backend
+    // shape) and stores it WITHOUT re-wrapping — `Arc<dyn Fn>` isn't `Fn`, so it can't go
+    // through `new`'s `impl Fn` bound.
+    #[test]
+    fn with_resolver_stores_prebuilt_arc_without_rewrapping() {
+        let resolver: Resolver =
+            Arc::new(|digest: &Digest32| Node::LabelOnly(NodeHeader::new(Some(*digest), None)));
+        let tree = AVLTree::with_resolver(resolver.clone(), 32, None);
+        assert!(
+            Arc::ptr_eq(&tree.resolver, &resolver),
+            "with_resolver must store the pre-built Resolver without re-wrapping"
+        );
     }
 }

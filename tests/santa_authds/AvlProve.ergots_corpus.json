@@ -1,0 +1,387 @@
+{
+  "schema" : "santa-authds/v1",
+  "op" : "authds:vendored:avl-prove",
+  "blessed_by" : "jvm:scrypto-3.0.0",
+  "source" : "ergots:packages/avltree/test/fixtures/prover",
+  "entries" : [
+    {
+      "name" : "batch-3-inserts",
+      "source" : "ergots:packages/avltree/test/fixtures/prover/batch-3-inserts.json",
+      "kind" : "avl_prove",
+      "settings" : {
+        "key_length" : 32,
+        "value_length" : null
+      },
+      "payload" : {
+        "operations" : [
+          {
+            "tag" : "Insert",
+            "key_hex" : "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "value_hex" : "0102"
+          },
+          {
+            "tag" : "Insert",
+            "key_hex" : "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "value_hex" : "0304"
+          },
+          {
+            "tag" : "Insert",
+            "key_hex" : "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "value_hex" : "0506"
+          }
+        ],
+        "gen_proof_after" : [
+          2
+        ]
+      },
+      "expected" : {
+        "proofs" : [
+          "020000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000000000400"
+        ],
+        "digests" : [
+          "b78df87662a5715179965dfd1169453c6738203c0027c416817348ac1b4dd50202"
+        ]
+      }
+    },
+    {
+      "name" : "batch-insert-remove",
+      "source" : "ergots:packages/avltree/test/fixtures/prover/batch-insert-remove.json",
+      "kind" : "avl_prove",
+      "settings" : {
+        "key_length" : 32,
+        "value_length" : null
+      },
+      "payload" : {
+        "operations" : [
+          {
+            "tag" : "Insert",
+            "key_hex" : "4242424242424242424242424242424242424242424242424242424242424242",
+            "value_hex" : "01020304"
+          },
+          {
+            "tag" : "Remove",
+            "key_hex" : "4242424242424242424242424242424242424242424242424242424242424242"
+          }
+        ],
+        "gen_proof_after" : [
+          1
+        ]
+      },
+      "expected" : {
+        "proofs" : [
+          "020000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000000000400"
+        ],
+        "digests" : [
+          "4ec61f485b98eb87153f7c57db4f5ecd75556fddbc403b41acf8441fde8e160900"
+        ]
+      }
+    },
+    {
+      "name" : "fixed-value-insert-genproof-remove",
+      "source" : "ergots:packages/avltree/test/fixtures/prover/fixed-value-insert-genproof-remove.json",
+      "kind" : "avl_prove",
+      "settings" : {
+        "key_length" : 32,
+        "value_length" : 8
+      },
+      "payload" : {
+        "operations" : [
+          {
+            "tag" : "Insert",
+            "key_hex" : "4242424242424242424242424242424242424242424242424242424242424242",
+            "value_hex" : "0102030405060708"
+          },
+          {
+            "tag" : "Remove",
+            "key_hex" : "4242424242424242424242424242424242424242424242424242424242424242"
+          }
+        ],
+        "gen_proof_after" : [
+          0,
+          1
+        ]
+      },
+      "expected" : {
+        "proofs" : [
+          "020000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000000000000000004",
+          "0200000000000000000000000000000000000000000000000000000000000000004242424242424242424242424242424242424242424242424242424242424242000000000000000002ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0102030405060708000400"
+        ],
+        "digests" : [
+          "df3e8faa3e2ce193a679b4f6eeb76de180f2eca8a662d83055fc62773a183a3101",
+          "aebde47e15b6bfb577265ea5a819f5779328085286d86e7e1089636641dae9b800"
+        ]
+      }
+    },
+    {
+      "name" : "insert-genproof-lookup-genproof",
+      "source" : "ergots:packages/avltree/test/fixtures/prover/insert-genproof-lookup-genproof.json",
+      "kind" : "avl_prove",
+      "settings" : {
+        "key_length" : 32,
+        "value_length" : null
+      },
+      "payload" : {
+        "operations" : [
+          {
+            "tag" : "Insert",
+            "key_hex" : "0707070707070707070707070707070707070707070707070707070707070707",
+            "value_hex" : "0909"
+          },
+          {
+            "tag" : "Lookup",
+            "key_hex" : "0707070707070707070707070707070707070707070707070707070707070707"
+          }
+        ],
+        "gen_proof_after" : [
+          0,
+          1
+        ]
+      },
+      "expected" : {
+        "proofs" : [
+          "020000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000004",
+          "0352665e83dc9366d2aed9115104d6103ef076f72b42ba35b4243dba36eec47f8f020707070707070707070707070707070707070707070707070707070707070707ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000000020909000400"
+        ],
+        "digests" : [
+          "cd964e1af6dfa7d20d9bf121c44dcf1605b7deb5aa047874b0246d0f4285947301",
+          "cd964e1af6dfa7d20d9bf121c44dcf1605b7deb5aa047874b0246d0f4285947301"
+        ]
+      }
+    },
+    {
+      "name" : "insert-genproof-remove-genproof",
+      "source" : "ergots:packages/avltree/test/fixtures/prover/insert-genproof-remove-genproof.json",
+      "kind" : "avl_prove",
+      "settings" : {
+        "key_length" : 32,
+        "value_length" : null
+      },
+      "payload" : {
+        "operations" : [
+          {
+            "tag" : "Insert",
+            "key_hex" : "4242424242424242424242424242424242424242424242424242424242424242",
+            "value_hex" : "01020304"
+          },
+          {
+            "tag" : "Remove",
+            "key_hex" : "4242424242424242424242424242424242424242424242424242424242424242"
+          }
+        ],
+        "gen_proof_after" : [
+          0,
+          1
+        ]
+      },
+      "expected" : {
+        "proofs" : [
+          "020000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000004",
+          "02000000000000000000000000000000000000000000000000000000000000000042424242424242424242424242424242424242424242424242424242424242420000000002ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000401020304000400"
+        ],
+        "digests" : [
+          "12a83992f8707b2d9d135fcc6b62d6707f77ea6193a8f0e0adb1751474f3df8101",
+          "4ec61f485b98eb87153f7c57db4f5ecd75556fddbc403b41acf8441fde8e160900"
+        ]
+      }
+    },
+    {
+      "name" : "insert-genproof-updatelongby-genproof",
+      "source" : "ergots:packages/avltree/test/fixtures/prover/insert-genproof-updatelongby-genproof.json",
+      "kind" : "avl_prove",
+      "settings" : {
+        "key_length" : 32,
+        "value_length" : 8
+      },
+      "payload" : {
+        "operations" : [
+          {
+            "tag" : "Insert",
+            "key_hex" : "4242424242424242424242424242424242424242424242424242424242424242",
+            "value_hex" : "6400000000000000"
+          },
+          {
+            "tag" : "UpdateLongBy",
+            "key_hex" : "4242424242424242424242424242424242424242424242424242424242424242",
+            "delta" : "50"
+          }
+        ],
+        "gen_proof_after" : [
+          0,
+          1
+        ]
+      },
+      "expected" : {
+        "proofs" : [
+          "020000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000000000000000004",
+          "03cb739332d7f0b9846fdd2dfb1acd06aa12e61921961f1aef82473e514f87af14024242424242424242424242424242424242424242424242424242424242424242ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6400000000000000000400"
+        ],
+        "digests" : [
+          "76f29ed08e3096146f125536c1eed27fbc3a9027fe364293dc037e598af1d75201",
+          "d059d98deeec3c1ddf8f05a5799544f6ce457a9530f45992368c0a9a0ee9d3df01"
+        ]
+      }
+    },
+    {
+      "name" : "insert-single",
+      "source" : "ergots:packages/avltree/test/fixtures/prover/insert-single.json",
+      "kind" : "avl_prove",
+      "settings" : {
+        "key_length" : 32,
+        "value_length" : null
+      },
+      "payload" : {
+        "operations" : [
+          {
+            "tag" : "Insert",
+            "key_hex" : "4242424242424242424242424242424242424242424242424242424242424242",
+            "value_hex" : "01020304"
+          }
+        ],
+        "gen_proof_after" : [
+          0
+        ]
+      },
+      "expected" : {
+        "proofs" : [
+          "020000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000004"
+        ],
+        "digests" : [
+          "12a83992f8707b2d9d135fcc6b62d6707f77ea6193a8f0e0adb1751474f3df8101"
+        ]
+      }
+    },
+    {
+      "name" : "insertorupdate-genproof-remove-genproof",
+      "source" : "ergots:packages/avltree/test/fixtures/prover/insertorupdate-genproof-remove-genproof.json",
+      "kind" : "avl_prove",
+      "settings" : {
+        "key_length" : 32,
+        "value_length" : null
+      },
+      "payload" : {
+        "operations" : [
+          {
+            "tag" : "InsertOrUpdate",
+            "key_hex" : "5555555555555555555555555555555555555555555555555555555555555555",
+            "value_hex" : "070707"
+          },
+          {
+            "tag" : "Remove",
+            "key_hex" : "5555555555555555555555555555555555555555555555555555555555555555"
+          }
+        ],
+        "gen_proof_after" : [
+          0,
+          1
+        ]
+      },
+      "expected" : {
+        "proofs" : [
+          "020000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000004",
+          "02000000000000000000000000000000000000000000000000000000000000000055555555555555555555555555555555555555555555555555555555555555550000000002ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000003070707000400"
+        ],
+        "digests" : [
+          "78cfe05781c533267b4e33fb95499c9cc0ff91ef35e5cbf3099560dfda3b59ca01",
+          "4ec61f485b98eb87153f7c57db4f5ecd75556fddbc403b41acf8441fde8e160900"
+        ]
+      }
+    },
+    {
+      "name" : "multi-batch-insert-insert-update",
+      "source" : "ergots:packages/avltree/test/fixtures/prover/multi-batch-insert-insert-update.json",
+      "kind" : "avl_prove",
+      "settings" : {
+        "key_length" : 32,
+        "value_length" : null
+      },
+      "payload" : {
+        "operations" : [
+          {
+            "tag" : "Insert",
+            "key_hex" : "0101010101010101010101010101010101010101010101010101010101010101",
+            "value_hex" : "0a14"
+          },
+          {
+            "tag" : "Insert",
+            "key_hex" : "0202020202020202020202020202020202020202020202020202020202020202",
+            "value_hex" : "1e28"
+          },
+          {
+            "tag" : "Update",
+            "key_hex" : "0202020202020202020202020202020202020202020202020202020202020202",
+            "value_hex" : "323c"
+          }
+        ],
+        "gen_proof_after" : [
+          0,
+          1,
+          2
+        ]
+      },
+      "expected" : {
+        "proofs" : [
+          "020000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000004",
+          "03e97b407dbcbf58aefc91cec7293c87b2afc236f1fbe52f88a0ec95cf3719ab21020101010101010101010101010101010101010101010101010101010101010101ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000000020a14000400",
+          "03e97b407dbcbf58aefc91cec7293c87b2afc236f1fbe52f88a0ec95cf3719ab2103fc6f7ba437185ddc4fb0b6afd5b108ec06230bed2a5965383c5579bc3de5bb14020202020202020202020202020202020202020202020202020202020202020202ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000000021e2800010400"
+        ],
+        "digests" : [
+          "9b6467d6076f657f6daca294d222ddf925e4c038d49490e620bba92c857977f301",
+          "0c2cbdfa5f85bcdd57a6bd5ac463033a1375ebf785da1fadc2e8d5935227e2bd02",
+          "073e10a084641a3b587aaee35d3c5a48448617e1ae987b4f4b4e8efa2ea1e96602"
+        ]
+      }
+    },
+    {
+      "name" : "multi-key-structural",
+      "source" : "ergots:packages/avltree/test/fixtures/prover/multi-key-structural.json",
+      "kind" : "avl_prove",
+      "settings" : {
+        "key_length" : 32,
+        "value_length" : null
+      },
+      "payload" : {
+        "operations" : [
+          {
+            "tag" : "Insert",
+            "key_hex" : "1010101010101010101010101010101010101010101010101010101010101010",
+            "value_hex" : "01"
+          },
+          {
+            "tag" : "Insert",
+            "key_hex" : "2020202020202020202020202020202020202020202020202020202020202020",
+            "value_hex" : "02"
+          },
+          {
+            "tag" : "Insert",
+            "key_hex" : "3030303030303030303030303030303030303030303030303030303030303030",
+            "value_hex" : "03"
+          },
+          {
+            "tag" : "Insert",
+            "key_hex" : "4040404040404040404040404040404040404040404040404040404040404040",
+            "value_hex" : "04"
+          },
+          {
+            "tag" : "Insert",
+            "key_hex" : "5050505050505050505050505050505050505050505050505050505050505050",
+            "value_hex" : "05"
+          }
+        ],
+        "gen_proof_after" : [
+          2,
+          4
+        ]
+      },
+      "expected" : {
+        "proofs" : [
+          "020000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000000000400",
+          "03d2b1f0561cf530ef3b48bd89454457c948fa0a98a2c88c97c73b0e8957d302df03b560256fa36c6b146a937bbba24e354a12600ad106b1af29304ce6270f7745f8023030303030303030303030303030303030303030303030303030303030303030ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000000010300000400"
+        ],
+        "digests" : [
+          "aa3e226ee0196f0797bafdb90c25a1116dea926e7e42f9cf2d73344c72ece76902",
+          "8a0fa0e5186be78c95e7d5c078f01c68ea7bfafdc9989f3507ae50598b5a4d4f03"
+        ]
+      }
+    }
+  ]
+}

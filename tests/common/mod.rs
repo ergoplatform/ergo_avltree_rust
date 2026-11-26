@@ -21,7 +21,8 @@ pub const MAX_KEY: [u8; KEY_LENGTH] = [0xFFu8; KEY_LENGTH];
 
 pub fn random_key_with_len(len: usize) -> ADKey {
     let key = (0..len).map(|_| rand::random::<u8>()).collect();
-    if key < Bytes::from(MIN_KEY.to_vec()) || key > Bytes::from(MAX_KEY.to_vec()) {
+    // strictly between the tree's -inf ([0x00; len]) and +inf ([0xff; len]) keys
+    if key <= Bytes::from(vec![0u8; len]) || key >= Bytes::from(vec![0xFFu8; len]) {
         random_key_with_len(len)
     } else {
         key

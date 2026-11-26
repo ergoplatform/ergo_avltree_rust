@@ -1728,3 +1728,17 @@ fn remove_nodes_benchmark() {
     }
     println!("Elapsed time: {:?}", now.elapsed());
 }
+
+#[test]
+fn random_keys_avoid_the_infinity_keys() {
+    // At key length 1 a uniform byte is 0x00 or 0xff once in 128 draws, so
+    // 20,000 draws reach both unless the generator excludes them.
+    for _ in 0..20_000 {
+        let key = random_key_with_len(1);
+        assert!(
+            key != Bytes::from(vec![0u8]) && key != Bytes::from(vec![0xFFu8]),
+            "{:?}",
+            key
+        );
+    }
+}

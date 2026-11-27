@@ -79,9 +79,11 @@ impl BatchAVLProver {
     /// @return - Success(Some(old value)), Success(None), or Failure
     ////
     pub fn perform_one_operation(&mut self, operation: &Operation) -> Result<Option<ADValue>> {
+        self.found = false;
         self.replay_index = self.directions_bit_length;
         let res = self.return_result_of_one_operation(operation, &self.top_node());
         if res.is_err() {
+            self.found = false;
             // take the bit length before fail and divide by 8 with rounding up
             let old_directions_byte_length = (self.replay_index + 7) / 8;
             // undo the changes to the directions array

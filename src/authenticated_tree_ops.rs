@@ -172,7 +172,6 @@ pub trait AuthenticatedTreeOps {
             new_right_balance,
         );
         let root = InternalNode::update(&new_root, &new_left_child, &new_right_child, 0i8);
-        this.tree.root = Some(root.clone());
         Ok(root)
     }
 
@@ -214,7 +213,6 @@ pub trait AuthenticatedTreeOps {
             new_left_balance,
         );
         let root = InternalNode::update(&new_root, &new_left_child, &new_right_child, 0i8);
-        this.tree.root = Some(root.clone());
         Ok(root)
     }
 

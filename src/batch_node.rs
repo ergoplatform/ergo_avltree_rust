@@ -481,7 +481,9 @@ impl AVLTree {
         let nr = &mut *node.borrow_mut();
         if let Node::Internal(r) = nr {
             self.extract_first_node_recursive(extractor, &self.resolve(&mut r.left))
-                .or(self.extract_first_node_recursive(extractor, &self.resolve(&mut r.right)))
+                .or_else(|| {
+                    self.extract_first_node_recursive(extractor, &self.resolve(&mut r.right))
+                })
         } else if extractor(nr) {
             Some(node.clone())
         } else {
